@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+train_ipo.py - Phase 4: Training with IPO on CWEval preference pairs
+Loads the train/val preference datasets.
+Configures LoRA + quantization (QLoRA) for Qwen3 Coder.
+Runs DPOTrainer with loss_type="ipo" across multiple independent seeds.
+Monitors validation loss and applies early stopping.
+Logs and plots loss curves.
+"""
+
+import os
+import json
+import argparse
+import torch
+import matplotlib.pyplot as plt
+from pathlib import Path
+from datasets import Dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    EarlyStoppingCallback,
+    set_seed
+)
+from peft import LoraConfig, prepare_model_for_kbit_training
+from trl import DPOTrainer, DPOConfig
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Phase 4: IPO Training Loop")
+    parser.add_argument("--model_id", type=str, default="qwen/qwen3-coder-30b", help="Hugging Face model ID")
+    parser.add_argument("--dataset_dir", type=str, default="results/dataset", help="Path to train/val pairs")
+    parser.add_argument("--output_dir", type=str, default="results/checkpoints", help="Where to save model checkpoints")
+    parser.add_argument("--seeds", type=str, default="42,123,456", help="Comma-separated random seeds for training")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha scaling factor")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=3, help="Max number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=4, help="Per-device train batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--quant_4bit", type=str, default="True", choices=["True", "False"], help="Load model in 4-bit QLoRA")
+    parser.add_argument("--early_stopping_patience", type=int, default=1, help="Patience for early stopping")
+    return parser.parse_args()
+
+def load_json_dataset(file_path):
+    with open(file_path, "r") as f:
+        data = json.load(f)
+    # Expected columns: prompt, chosen, rejected
+    return Dataset.from_list(data)
+
+def plot_loss_curves(log_history, output_path, seed):
+    train_steps = []
+    train_losses = []
+    eval_steps = []
+    eval_losses = []
+
+    for entry in log_history:
+        step = entry.get("step")
+        if "loss" in entry and step is not None:
+            train_steps.append(step)
+            train_losses.append(entry["loss"])
+        if "eval_loss" in entry and step is not None:
+            eval_steps.append(step)
+            eval_losses.append(entry["eval_loss"])
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_steps, train_losses, label="Train Loss", color="blue", alpha=0.7)
+    if eval_losses:
+        plt.plot(eval_steps, eval_losses, label="Validation Loss", color="red", marker='o')
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.title(f"IPO Training Curves (Seed {seed})")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.6)
+    
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def main():
+    args = parse_args()
+    seeds = [int(s.strip()) for s in args.seeds.split(",")]
+    
+    dataset_path = Path(args.dataset_dir)
+    train_file = dataset_path / "train_pairs.json"
+    val_file = dataset_path / "val_pairs.json"
+
+    if not train_file.exists() or not val_file.exists():
+        print(f"Error: Datasets not found at {dataset_path}. Please run build_preference_dataset.py first.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Loading datasets...")
+    train_dataset = load_json_dataset(train_file)
+    val_dataset = load_json_dataset(val_file)
+    print(f"Loaded {len(train_dataset)} train pairs and {len(val_dataset)} val pairs.")
+
+    # Base model setup
+    device_map = "auto"
+    bnb_config = None
+    if args.quant_4bit == "True":
+        print("Configuring QLoRA 4-bit bitsandbytes...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            bnb_4bit_use_double_quant=True
+        )
+
+    # 5. Loop over independent seeds
+    for seed in seeds:
+        print(f"\n==========================================")
+        print(f"Starting Training for Seed {seed}")
+        print(f"==========================================")
+        
+        set_seed(seed)
+        seed_output_dir = Path(args.output_dir) / f"seed_{seed}"
+        seed_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load Tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Load Model
+        print(f"Loading base model {args.model_id}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            trust_remote_code=True
+        )
+
+        if args.quant_4bit == "True":
+            model = prepare_model_for_kbit_training(model)
+
+        # Configure PEFT / LoRA
+        # Qwen models typically use q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+
+        # Setup training arguments
+        # DPOConfig inherits from TrainingArguments
+        training_args = DPOConfig(
+            output_dir=str(seed_output_dir),
+            loss_type="ipo",
+            beta=0.1,  # IPO weight parameter
+            per_device_train_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            num_train_epochs=args.epochs,
+            evaluation_strategy="steps",
+            eval_steps=10,
+            save_strategy="steps",
+            save_steps=10,
+            logging_steps=5,
+            warmup_ratio=0.1,
+            lr_scheduler_type="cosine",
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            fp16=not torch.cuda.is_bf16_supported(),
+            bf16=torch.cuda.is_bf16_supported(),
+            remove_unused_columns=False,  # Important for DPOTrainer
+            seed=seed,
+            report_to="none"
+        )
+
+        # Setup DPOTrainer
+        trainer = DPOTrainer(
+            model=model,
+            ref_model=None,  # Set to None to automatically use base model with adapter disabled
+            args=training_args,
+            beta=0.1,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            tokenizer=tokenizer,
+            peft_config=peft_config,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)]
+        )
+
+        print("Training in progress...")
+        train_result = trainer.train()
+
+        # Save the best PEFT adapter checkpoint
+        best_checkpoint_dir = seed_output_dir / "best_model"
+        trainer.save_model(str(best_checkpoint_dir))
+        print(f"Best adapter checkpoints saved to {best_checkpoint_dir}")
+
+        # Save training logs history
+        log_history = trainer.state.log_history
+        with open(seed_output_dir / "log_history.json", "w") as f:
+            json.dump(log_history, f, indent=2)
+
+        # Plot training curves
+        plot_path = seed_output_dir / "loss_curves.png"
+        plot_loss_curves(log_history, plot_path, seed)
+        print(f"Loss curves plot saved to {plot_path}")
+
+        # Clean up model to free up memory before next seed
+        del model
+        del trainer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print("\n=== All Seeds Completed Successfully! ===")
+
+if __name__ == "__main__":
+    main()

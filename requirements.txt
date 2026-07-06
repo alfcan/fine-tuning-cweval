@@ -1,0 +1,12 @@
+transformers
+peft
+trl
+accelerate
+bitsandbytes
+litellm
+pandas
+numpy
+matplotlib
+scipy
+requests
+tqdm

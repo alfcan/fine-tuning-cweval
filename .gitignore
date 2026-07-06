@@ -1,0 +1,50 @@
+# .gitignore for Preference-based Security Alignment project
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment directories (if any)
+venv/
+.venv/
+env/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Results, logs, and temporary data
+results/
+*.log
+*.tmp
+
+# Model checkpoints and merged models
+results/checkpoints/
+results/merged/
+
+# CWEval cloned repository (if you want to keep it out of git)
+CWEval/
+
+# Environment files
+.env
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Other generated artifacts
+*.ipynb
+*.pdf
+*.svg
+*.png
+
+# IDE specific files (VSCode, PyCharm)
+.vscode/
+.idea/
+*.iml
+
+# Any other build artifacts
+build/
+
+# Cache files
+.cache/
