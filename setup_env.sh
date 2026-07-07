@@ -30,7 +30,13 @@ pip install \
     matplotlib \
     scipy \
     requests \
-    tqdm
+    tqdm \
+    fastapi \
+    uvicorn
+
+# 4. Install CWEval requirements
+echo "Installing CWEval core requirements..."
+pip install -r CWEval/requirements/core.txt
 
 echo "=== Setup Complete ==="
 echo "To run CWEval tests inside Docker container:"

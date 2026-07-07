@@ -10,3 +10,5 @@ matplotlib
 scipy
 requests
 tqdm
+fastapi
+uvicorn

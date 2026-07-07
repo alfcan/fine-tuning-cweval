@@ -25,11 +25,10 @@ pip install -r requirements.txt
 
 Follow these steps sequentially to run the entire pilot study:
 
-### Step 0: Start the Model Server
-Start your local OpenAI-compatible inference server (e.g., LM Studio or vLLM) hosting the base model:
-- **Model**: `qwen/qwen3-coder-30b` (or similar)
-- **API Endpoint**: `http://localhost:1234/v1`
-- **Model Identifier for LiteLLM**: Use the `openai/` prefix (e.g., `openai/qwen/qwen3-coder-30b`) to instruct LiteLLM to route calls via the OpenAI-compatible server.
+### Step 0: Model Inference
+The pipeline scripts automatically launch and terminate a local, unquantized OpenAI-compatible inference server using `openai_server.py`. You do not need to manually configure LM Studio or vLLM.
+- **Model**: `Qwen/Qwen3.5-2B` (hosted on Hugging Face, downloaded automatically)
+- **API Endpoint**: `http://127.0.0.1:1234/v1` (managed automatically by background processes)
 
 ---
 
@@ -38,7 +37,7 @@ Evaluate the untouched base model across all 5 programming languages in CWEval t
 
 ```bash
 python run_baseline.py \
-  --model "openai/qwen/qwen3-coder-30b" \
+  --model "openai/Qwen/Qwen3.5-2B" \
   --eval_path "results/baseline" \
   --api_base "http://localhost:1234/v1" \
   --api_key "sk-local-research" \
@@ -53,7 +52,7 @@ Query the model server at multiple temperatures to generate correct secure/vulne
 
 ```bash
 python build_preference_dataset.py \
-  --model "openai/qwen/qwen3-coder-30b" \
+  --model "openai/Qwen/Qwen3.5-2B" \
   --api_base "http://localhost:1234/v1" \
   --api_key "sk-local-research" \
   --n_samples 10 \
@@ -66,16 +65,16 @@ This produces `results/dataset/train_pairs.json` and `results/dataset/val_pairs.
 ---
 
 ### Step 3: Phase 4 — IPO Alignment Training
-Train LoRA/PEFT adapters with TRL's `DPOTrainer` (using the IPO loss) across 3 independent seeds. This script automatically uses 4-bit QLoRA to fit the 30B model into standard GPU VRAM and implements early stopping:
+Train LoRA/PEFT adapters with TRL's `DPOTrainer` (using the IPO loss) across 3 independent seeds. This script runs fine-tuning in full precision (no quantization) on the Qwen 2B model and implements early stopping:
 
 ```bash
 python train_ipo.py \
-  --model_id "qwen/qwen3-coder-30b" \
+  --model_id "Qwen/Qwen3.5-2B" \
   --dataset_dir "results/dataset" \
   --seeds "42,123,456" \
   --epochs 3 \
   --batch_size 4 \
-  --quant_4bit True
+  --quant_4bit False
 ```
 This saves adapter checkpoints and outputs loss curves under `results/checkpoints/seed_<seed>/`.
 
@@ -86,7 +85,7 @@ Merge the trained adapter weights with the base model, and run comparative evalu
 
 ```bash
 python run_evaluation.py \
-  --model_id "openai/qwen/qwen3-coder-30b" \
+  --model_id "openai/Qwen/Qwen3.5-2B" \
   --seeds "42,123,456" \
   --api_base "http://localhost:1234/v1" \
   --api_key "sk-local-research" \

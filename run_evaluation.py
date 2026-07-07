@@ -13,13 +13,16 @@ import argparse
 import subprocess
 import sys
 import random
+import time
+import requests
+import urllib.parse
 from pathlib import Path
 import numpy as np
 import torch
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase 5: Evaluation & Analysis")
-    parser.add_argument("--model_id", type=str, default="qwen/qwen3-coder-30b", help="Base model ID")
+    parser.add_argument("--model_id", type=str, default="openai/Qwen/Qwen3.5-2B", help="Base model ID")
     parser.add_argument("--adapter_dir", type=str, default="results/checkpoints", help="Path containing seed checkpoints")
     parser.add_argument("--merged_dir", type=str, default="results/merged", help="Directory to save merged models")
     parser.add_argument("--dataset_dir", type=str, default="results/dataset", help="Path containing dataset summaries")
@@ -30,7 +33,7 @@ def parse_args():
     parser.add_argument("--seeds", type=str, default="42,123,456", help="Comma-separated random seeds used in training")
     parser.add_argument("--skip_merge", action="store_true", help="Skip the PEFT merge step")
     parser.add_argument("--bootstrap_samples", type=int, default=1000, help="Number of bootstrap resamples for CI")
-    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="LM Studio API base url")
+    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="Local model server API base url")
     parser.add_argument("--api_key", type=str, default="sk-local-research", help="API key for inference server")
     return parser.parse_args()
 
@@ -42,13 +45,52 @@ def run_command(cmd, cwd=None):
         env["PYTHONPATH"] = cweval_abs + os.pathsep + env["PYTHONPATH"]
     else:
         env["PYTHONPATH"] = cweval_abs
-    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    result = subprocess.run(cmd, cwd=cwd, env=env)
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}", file=sys.stderr)
-        print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
-        print(f"STDERR:\n{result.stderr}", file=sys.stderr)
         sys.exit(result.returncode)
-    return result.stdout
+    return ""
+
+def start_local_server(model_id_or_path, api_base):
+    # Parse port from api_base (e.g. http://localhost:1234/v1)
+    port = 1234
+    try:
+        parsed = urllib.parse.urlparse(api_base)
+        if parsed.port:
+            port = parsed.port
+    except Exception:
+        pass
+
+    model_id = model_id_or_path
+    if model_id.startswith("openai/"):
+        model_id = model_id[len("openai/"):]
+
+    print(f"Starting local model server for '{model_id}' on port {port}...")
+    server_process = subprocess.Popen([
+        sys.executable, "openai_server.py",
+        "--model", model_id,
+        "--port", str(port)
+    ])
+
+    # Wait for the server to be ready by checking /health endpoint
+    max_retries = 60
+    for i in range(max_retries):
+        try:
+            resp = requests.get(f"http://localhost:{port}/health", timeout=1)
+            if resp.status_code == 200:
+                print("Local model server is ready!")
+                return server_process
+        except Exception:
+            pass
+        time.sleep(1)
+        if server_process.poll() is not None:
+            print("Local model server process terminated unexpectedly.")
+            sys.exit(1)
+
+    print("Timeout waiting for local model server to start.")
+    server_process.terminate()
+    server_process.wait()
+    sys.exit(1)
 
 def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
     """
@@ -56,6 +98,11 @@ def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
     """
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # Clean the base_model_id (strip openai/ if present)
+    base_model_id_clean = base_model_id
+    if base_model_id_clean.startswith("openai/"):
+        base_model_id_clean = base_model_id_clean[len("openai/"):]
 
     for seed in seeds:
         seed_adapter = Path(adapter_dir) / f"seed_{seed}" / "best_model"
@@ -70,15 +117,15 @@ def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
             continue
 
         print(f"\nMerging adapter for Seed {seed}...")
-        print(f"Loading base model {base_model_id}...")
+        print(f"Loading base model {base_model_id_clean}...")
         
         base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_id,
+            base_model_id_clean,
             torch_dtype=torch.float16,
             device_map="cpu",
             trust_remote_code=True
         )
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id_clean)
 
         print(f"Loading adapter from {seed_adapter}...")
         model = PeftModel.from_pretrained(base_model, seed_adapter)
@@ -203,34 +250,40 @@ def main():
         print(f"Evaluating Model Configuration: {name}")
         print(f"==========================================")
         
-        eval_path = Path(args.eval_base_dir) / name
-        if eval_path.exists():
-            import shutil
-            shutil.rmtree(eval_path)
-        
-        gen_script = str(Path(args.cweval_dir) / "cweval" / "generate.py")
-        eval_script = str(Path(args.cweval_dir) / "cweval" / "evaluate.py")
+        server_proc = start_local_server(model_path, args.api_base)
+        try:
+            eval_path = Path(args.eval_base_dir) / name
+            if eval_path.exists():
+                import shutil
+                shutil.rmtree(eval_path)
+            
+            gen_script = str(Path(args.cweval_dir) / "cweval" / "generate.py")
+            eval_script = str(Path(args.cweval_dir) / "cweval" / "evaluate.py")
 
-        # Run generation
-        gen_cmd = [
-            sys.executable, gen_script, "gen",
-            "--model", model_path,
-            "--n", "1",
-            "--temperature", "0.0",
-            "--eval_path", str(eval_path),
-            "--api_base", args.api_base,
-            "--api_key", args.api_key
-        ]
-        run_command(gen_cmd)
+            # Run generation
+            gen_cmd = [
+                sys.executable, gen_script, "gen",
+                "--model", model_path,
+                "--n", "1",
+                "--temperature", "0.0",
+                "--eval_path", str(eval_path),
+                "--api_base", args.api_base,
+                "--api_key", args.api_key
+            ]
+            run_command(gen_cmd)
 
-        # Run evaluation pipeline
-        eval_cmd = [
-            sys.executable, eval_script, "pipeline",
-            "--eval_path", str(eval_path),
-            "--num_proc", str(args.num_proc),
-            "--docker", args.docker
-        ]
-        run_command(eval_cmd)
+            # Run evaluation pipeline
+            eval_cmd = [
+                sys.executable, eval_script, "pipeline",
+                "--eval_path", str(eval_path),
+                "--num_proc", str(args.num_proc),
+                "--docker", args.docker
+            ]
+            run_command(eval_cmd)
+        finally:
+            print("Stopping local model server...")
+            server_proc.terminate()
+            server_proc.wait()
 
         # Load res_all.json
         res_file = eval_path / "res_all.json"

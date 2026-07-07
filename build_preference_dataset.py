@@ -20,9 +20,9 @@ import requests
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase 2 & 3: Preference Dataset Builder")
-    parser.add_argument("--model", type=str, default="openai/qwen/qwen3-coder-30b", help="Model to query via LM Studio")
-    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="LM Studio API base url")
-    parser.add_argument("--api_key", type=str, default="sk-local-research", help="LM Studio API key")
+    parser.add_argument("--model", type=str, default="openai/Qwen/Qwen3.5-2B", help="Model to query via local API server")
+    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="Local model server API base url")
+    parser.add_argument("--api_key", type=str, default="sk-local-research", help="API key for inference server")
     parser.add_argument("--eval_base_dir", type=str, default="results/preference_gen", help="Directory for generations")
     parser.add_argument("--cweval_dir", type=str, default="CWEval", help="Path to cloned CWEval directory")
     parser.add_argument("--docker", type=str, default="True", choices=["True", "False"], help="Run evaluation inside Docker")
@@ -31,6 +31,51 @@ def parse_args():
     parser.add_argument("--max_pairs_per_task", type=int, default=8, help="Maximum number of pairs to keep per task")
     parser.add_argument("--train_split", type=float, default=0.8, help="Fraction of tasks to assign to train set")
     return parser.parse_args()
+
+def start_local_server(model_id_or_path, api_base):
+    import time
+    import requests
+    import urllib.parse
+    
+    # Parse port from api_base
+    port = 1234
+    try:
+        parsed = urllib.parse.urlparse(api_base)
+        if parsed.port:
+            port = parsed.port
+    except Exception:
+        pass
+
+    model_id = model_id_or_path
+    if model_id.startswith("openai/"):
+        model_id = model_id[len("openai/"):]
+
+    print(f"Starting local model server for '{model_id}' on port {port}...")
+    server_process = subprocess.Popen([
+        sys.executable, "openai_server.py",
+        "--model", model_id,
+        "--port", str(port)
+    ])
+
+    # Wait for the server to be ready by checking /health endpoint
+    max_retries = 60
+    for i in range(max_retries):
+        try:
+            resp = requests.get(f"http://localhost:{port}/health", timeout=1)
+            if resp.status_code == 200:
+                print("Local model server is ready!")
+                return server_process
+        except Exception:
+            pass
+        time.sleep(1)
+        if server_process.poll() is not None:
+            print("Local model server process terminated unexpectedly.")
+            sys.exit(1)
+
+    print("Timeout waiting for local model server to start.")
+    server_process.terminate()
+    server_process.wait()
+    sys.exit(1)
 
 def check_func_and_sec(attempt):
     if isinstance(attempt, dict):
@@ -71,13 +116,11 @@ def run_command(cmd, cwd=None):
         env["PYTHONPATH"] = cweval_abs + os.pathsep + env["PYTHONPATH"]
     else:
         env["PYTHONPATH"] = cweval_abs
-    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    result = subprocess.run(cmd, cwd=cwd, env=env)
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}", file=sys.stderr)
-        print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
-        print(f"STDERR:\n{result.stderr}", file=sys.stderr)
         sys.exit(result.returncode)
-    return result.stdout
+    return ""
 
 def normalize_code(code):
     # Strip comments and docstrings, then compress whitespace to identify duplicates
@@ -193,6 +236,8 @@ def main():
 
     temperatures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     
+    # Start the local model server
+    server_proc = start_local_server(args.model, args.api_base)
     try:
         # 3. Generate samples at multiple temperatures
         for temp in temperatures:
@@ -400,6 +445,9 @@ def main():
 
     finally:
         print("\nCompleted generation/evaluation attempts.")
+        print("Stopping local model server...")
+        server_proc.terminate()
+        server_proc.wait()
 
     # 5. Pair Construction and Deduplication
     print("\n=== Constructing Preference Pairs ===")

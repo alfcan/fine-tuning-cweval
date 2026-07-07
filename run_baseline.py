@@ -11,18 +11,62 @@ import json
 import argparse
 import subprocess
 import sys
+import time
+import requests
+import urllib.parse
 from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase 1: Baseline check on CWEval")
-    parser.add_argument("--model", type=str, default="qwen/qwen3-coder-30b", help="Model to evaluate")
+    parser.add_argument("--model", type=str, default="openai/Qwen/Qwen3.5-2B", help="Model to evaluate")
     parser.add_argument("--eval_path", type=str, default="results/baseline", help="Directory to save evaluation outputs")
     parser.add_argument("--docker", type=str, default="True", choices=["True", "False"], help="Run CWEval evaluation inside Docker")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of parallel processes for evaluation")
     parser.add_argument("--cweval_dir", type=str, default="CWEval", help="Path to cloned CWEval directory")
-    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="LM Studio API base url")
+    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="Local model server API base url")
     parser.add_argument("--api_key", type=str, default="sk-local-research", help="API key for inference server")
     return parser.parse_args()
+
+def start_local_server(model_id_or_path, api_base):
+    # Parse port from api_base (e.g. http://localhost:1234/v1)
+    port = 1234
+    try:
+        parsed = urllib.parse.urlparse(api_base)
+        if parsed.port:
+            port = parsed.port
+    except Exception:
+        pass
+
+    model_id = model_id_or_path
+    if model_id.startswith("openai/"):
+        model_id = model_id[len("openai/"):]
+
+    print(f"Starting local model server for '{model_id}' on port {port}...")
+    server_process = subprocess.Popen([
+        sys.executable, "openai_server.py",
+        "--model", model_id,
+        "--port", str(port)
+    ])
+
+    # Wait for the server to be ready by checking /health endpoint
+    max_retries = 60
+    for i in range(max_retries):
+        try:
+            resp = requests.get(f"http://localhost:{port}/health", timeout=1)
+            if resp.status_code == 200:
+                print("Local model server is ready!")
+                return server_process
+        except Exception:
+            pass
+        time.sleep(1)
+        if server_process.poll() is not None:
+            print("Local model server process terminated unexpectedly.")
+            sys.exit(1)
+
+    print("Timeout waiting for local model server to start.")
+    server_process.terminate()
+    server_process.wait()
+    sys.exit(1)
 
 def check_func_and_sec(attempt):
     """
@@ -73,13 +117,11 @@ def run_command(cmd, cwd=None):
         env["PYTHONPATH"] = cweval_abs + os.pathsep + env["PYTHONPATH"]
     else:
         env["PYTHONPATH"] = cweval_abs
-    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    result = subprocess.run(cmd, cwd=cwd, env=env)
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}", file=sys.stderr)
-        print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
-        print(f"STDERR:\n{result.stderr}", file=sys.stderr)
         sys.exit(result.returncode)
-    return result.stdout
+    return ""
 
 def main():
     args = parse_args()
@@ -100,44 +142,52 @@ def main():
 
     print(f"=== Starting Baseline Evaluation for model: {args.model} ===")
     
-    # CWEval scripts use relative paths internally (BENCHMARK_DIR = 'benchmark'),
-    # so all subprocesses must run with cwd=CWEval. We use absolute eval_path to
-    # ensure outputs land in the right place regardless of cwd.
-    eval_path_abs = str(Path(args.eval_path).resolve())
+    # Start the local model server
+    server_proc = start_local_server(args.model, args.api_base)
     
-    # Clear directory to prevent generate.py from prompting for overwrite
-    eval_dir = Path(eval_path_abs)
-    if eval_dir.exists():
-        import shutil
-        print(f"Clearing existing evaluation directory: {eval_path_abs}")
-        shutil.rmtree(eval_dir)
-    
-    # 1. Run generation using CWEval's script (cwd must be CWEval for benchmark discovery)
-    gen_script = str(cweval_path / "cweval" / "generate.py")
-    gen_cmd = [
-        sys.executable, gen_script, "gen",
-        "--model", args.model,
-        "--n", "1",
-        "--eval_path", eval_path_abs,
-        "--temperature", "0.0",
-        "--api_base", args.api_base,
-        "--api_key", args.api_key
-    ]
-    run_command(gen_cmd, cwd=str(cweval_path))
-    
-    # 2. Run evaluation pipeline
-    if args.docker == "True":
-        from cweval_orchestrator import run_evaluation_in_docker
-        run_evaluation_in_docker(eval_path_abs, num_proc=args.num_proc)
-    else:
-        eval_script = str(cweval_path / "cweval" / "evaluate.py")
-        eval_cmd = [
-            sys.executable, eval_script, "pipeline",
+    try:
+        # CWEval scripts use relative paths internally (BENCHMARK_DIR = 'benchmark'),
+        # so all subprocesses must run with cwd=CWEval. We use absolute eval_path to
+        # ensure outputs land in the right place regardless of cwd.
+        eval_path_abs = str(Path(args.eval_path).resolve())
+        
+        # Clear directory to prevent generate.py from prompting for overwrite
+        eval_dir = Path(eval_path_abs)
+        if eval_dir.exists():
+            import shutil
+            print(f"Clearing existing evaluation directory: {eval_path_abs}")
+            shutil.rmtree(eval_dir)
+        
+        # 1. Run generation using CWEval's script (cwd must be CWEval for benchmark discovery)
+        gen_script = str(cweval_path / "cweval" / "generate.py")
+        gen_cmd = [
+            sys.executable, gen_script, "gen",
+            "--model", args.model,
+            "--n", "1",
             "--eval_path", eval_path_abs,
-            "--num_proc", str(args.num_proc),
-            "--docker", "False"
+            "--temperature", "0.0",
+            "--api_base", args.api_base,
+            "--api_key", args.api_key
         ]
-        run_command(eval_cmd, cwd=str(cweval_path))
+        run_command(gen_cmd, cwd=str(cweval_path))
+        
+        # 2. Run evaluation pipeline
+        if args.docker == "True":
+            from cweval_orchestrator import run_evaluation_in_docker
+            run_evaluation_in_docker(eval_path_abs, num_proc=args.num_proc)
+        else:
+            eval_script = str(cweval_path / "cweval" / "evaluate.py")
+            eval_cmd = [
+                sys.executable, eval_script, "pipeline",
+                "--eval_path", eval_path_abs,
+                "--num_proc", str(args.num_proc),
+                "--docker", "False"
+            ]
+            run_command(eval_cmd, cwd=str(cweval_path))
+    finally:
+        print("Stopping local model server...")
+        server_proc.terminate()
+        server_proc.wait()
 
     # 3. Parse res_all.json
     res_file = Path(args.eval_path) / "res_all.json"

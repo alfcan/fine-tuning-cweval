@@ -27,7 +27,7 @@ from trl import DPOTrainer, DPOConfig
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase 4: IPO Training Loop")
-    parser.add_argument("--model_id", type=str, default="qwen/qwen3-coder-30b", help="Hugging Face model ID")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3.5-2B", help="Hugging Face model ID")
     parser.add_argument("--dataset_dir", type=str, default="results/dataset", help="Path to train/val pairs")
     parser.add_argument("--output_dir", type=str, default="results/checkpoints", help="Where to save model checkpoints")
     parser.add_argument("--seeds", type=str, default="42,123,456", help="Comma-separated random seeds for training")
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=3, help="Max number of training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Per-device train batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--quant_4bit", type=str, default="True", choices=["True", "False"], help="Load model in 4-bit QLoRA")
+    parser.add_argument("--quant_4bit", type=str, default="False", choices=["True", "False"], help="Load model in 4-bit QLoRA")
     parser.add_argument("--early_stopping_patience", type=int, default=1, help="Patience for early stopping")
     return parser.parse_args()
 

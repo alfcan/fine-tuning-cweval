@@ -7,7 +7,7 @@ Do security preferences learned via IPO on Python tasks from CWEval transfer to 
 
 ## Phase 0 — Environment Setup
 - [ ] Pull and run the official CWEval Docker image (`co1lin/cweval`) — handles compilation/execution uniformly across all 5 languages.
-- [ ] Set up target model:  Qwen3 Coder (qwen/qwen3-coder-30b via LM Studio) + LoRA/PEFT.
+- [ ] Set up target model: Qwen/Qwen3.5-2B (locally via Hugging Face) + LoRA/PEFT.
 - [ ] Install TRL (for `DPOTrainer` with `loss_type="ipo"`), plus standard HF stack (transformers, peft, accelerate, bitsandbytes if quantizing).
 - [ ] Clone CWEval repo, verify `evaluate.py pipeline` runs end-to-end on a sample task per language (sanity check before scaling).
 - [ ] Set up a sandboxed execution wrapper (subprocess w/ timeout, resource limits) if anything needs to run outside the Docker harness (e.g., ad-hoc sampling generation scripts).
