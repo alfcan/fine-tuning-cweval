@@ -17,9 +17,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Phase 1: Baseline check on CWEval")
     parser.add_argument("--model", type=str, default="qwen/qwen3-coder-30b", help="Model to evaluate")
     parser.add_argument("--eval_path", type=str, default="results/baseline", help="Directory to save evaluation outputs")
-    parser.add_argument("--docker", type=str, default="False", choices=["True", "False"], help="Run CWEval evaluation inside Docker")
+    parser.add_argument("--docker", type=str, default="True", choices=["True", "False"], help="Run CWEval evaluation inside Docker")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of parallel processes for evaluation")
     parser.add_argument("--cweval_dir", type=str, default="CWEval", help="Path to cloned CWEval directory")
+    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="LM Studio API base url")
+    parser.add_argument("--api_key", type=str, default="sk-local-research", help="API key for inference server")
     return parser.parse_args()
 
 def check_func_and_sec(attempt):
@@ -65,7 +67,13 @@ def check_func_and_sec(attempt):
 
 def run_command(cmd, cwd=None):
     print(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    env = os.environ.copy()
+    cweval_abs = os.path.abspath("CWEval")
+    if "PYTHONPATH" in env:
+        env["PYTHONPATH"] = cweval_abs + os.pathsep + env["PYTHONPATH"]
+    else:
+        env["PYTHONPATH"] = cweval_abs
+    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}", file=sys.stderr)
         print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
@@ -76,35 +84,60 @@ def run_command(cmd, cwd=None):
 def main():
     args = parse_args()
     
+    # Configure API base and key in environment for litellm
+    if args.api_base:
+        os.environ["OPENAI_API_BASE"] = args.api_base
+        print(f"Set environment OPENAI_API_BASE={args.api_base}")
+    if args.api_key:
+        os.environ["OPENAI_API_KEY"] = args.api_key
+        print(f"Set environment OPENAI_API_KEY={args.api_key}")
+    
     # Verify CWEval directory
-    cweval_path = Path(args.cweval_dir)
+    cweval_path = Path(args.cweval_dir).resolve()
     if not cweval_path.exists():
         print(f"CWEval repository not found at {cweval_path}. Please run setup_env.sh first.", file=sys.stderr)
         sys.exit(1)
 
     print(f"=== Starting Baseline Evaluation for model: {args.model} ===")
     
-    # 1. Run generation using CWEval's script
-    # cweval/generate.py gen --model <model> --n 1 --eval_path <eval_path> --temperature 0.0
+    # CWEval scripts use relative paths internally (BENCHMARK_DIR = 'benchmark'),
+    # so all subprocesses must run with cwd=CWEval. We use absolute eval_path to
+    # ensure outputs land in the right place regardless of cwd.
+    eval_path_abs = str(Path(args.eval_path).resolve())
+    
+    # Clear directory to prevent generate.py from prompting for overwrite
+    eval_dir = Path(eval_path_abs)
+    if eval_dir.exists():
+        import shutil
+        print(f"Clearing existing evaluation directory: {eval_path_abs}")
+        shutil.rmtree(eval_dir)
+    
+    # 1. Run generation using CWEval's script (cwd must be CWEval for benchmark discovery)
     gen_script = str(cweval_path / "cweval" / "generate.py")
     gen_cmd = [
         sys.executable, gen_script, "gen",
         "--model", args.model,
         "--n", "1",
-        "--eval_path", args.eval_path,
-        "--temperature", "0.0"
+        "--eval_path", eval_path_abs,
+        "--temperature", "0.0",
+        "--api_base", args.api_base,
+        "--api_key", args.api_key
     ]
-    run_command(gen_cmd)
+    run_command(gen_cmd, cwd=str(cweval_path))
     
-    # 2. Run evaluation pipeline using CWEval's script
-    eval_script = str(cweval_path / "cweval" / "evaluate.py")
-    eval_cmd = [
-        sys.executable, eval_script, "pipeline",
-        "--eval_path", args.eval_path,
-        "--num_proc", str(args.num_proc),
-        "--docker", args.docker
-    ]
-    run_command(eval_cmd)
+    # 2. Run evaluation pipeline
+    if args.docker == "True":
+        from cweval_orchestrator import run_evaluation_in_docker
+        run_evaluation_in_docker(eval_path_abs, num_proc=args.num_proc)
+    else:
+        eval_script = str(cweval_path / "cweval" / "evaluate.py")
+        eval_cmd = [
+            sys.executable, eval_script, "pipeline",
+            "--eval_path", eval_path_abs,
+            "--num_proc", str(args.num_proc),
+            "--docker", "False"
+        ]
+        run_command(eval_cmd, cwd=str(cweval_path))
 
     # 3. Parse res_all.json
     res_file = Path(args.eval_path) / "res_all.json"
@@ -115,17 +148,28 @@ def main():
     with open(res_file, "r") as f:
         res_data = json.load(f)
 
-    # Group tasks by language
-    # Typically, task_id looks like: "python/cwe-022/task_0"
+    # Group tasks by language/category matching benchmark definitions
     metrics_by_lang = {}
     
+    def filename_to_lang(path: str) -> str:
+        # Normalize slashes to forward slashes
+        normalized_path = path.replace("\\", "/")
+        # These match standard benchmark category filters in evaluate.py
+        categories = ["core/c/", "core/cpp/", "core/go/", "core/py/", "core/js/", "lang/c"]
+        for cat in categories:
+            if cat in normalized_path:
+                return cat
+        
+        # Fallback to basename extraction
+        filename = os.path.splitext(os.path.basename(path))[0]
+        lang = filename.split('_')[-2]
+        if lang.isdigit():
+            return 'py'
+        return lang
+
     for task_id, attempts in res_data.items():
         # Identify language from task_id
-        parts = task_id.split("/")
-        if len(parts) >= 1:
-            lang = parts[0]
-        else:
-            lang = "unknown"
+        lang = filename_to_lang(task_id)
             
         if lang not in metrics_by_lang:
             metrics_by_lang[lang] = {
@@ -136,11 +180,13 @@ def main():
                 "vulnerable_correct": 0
             }
             
+        # We did n=1 sampling for baseline
+        n_samples = len(attempts.get("functional", []))
         metrics_by_lang[lang]["total_tasks"] += 1
         
-        # We did n=1 sampling for baseline
-        for attempt in attempts:
-            is_func, is_sec = check_func_and_sec(attempt)
+        for idx in range(n_samples):
+            is_func = attempts["functional"][idx]
+            is_sec = attempts["secure"][idx]
             if is_func:
                 metrics_by_lang[lang]["functional_correct"] += 1
                 if is_sec:
@@ -149,6 +195,21 @@ def main():
                     metrics_by_lang[lang]["vulnerable_correct"] += 1
             if is_sec:
                 metrics_by_lang[lang]["total_secure"] += 1
+
+    # Also compute overall/all metrics
+    if metrics_by_lang:
+        total_tasks = sum(m["total_tasks"] for m in metrics_by_lang.values())
+        functional_correct = sum(m["functional_correct"] for m in metrics_by_lang.values())
+        secure_given_correct = sum(m["secure_given_correct"] for m in metrics_by_lang.values())
+        total_secure = sum(m["total_secure"] for m in metrics_by_lang.values())
+        vulnerable_correct = sum(m["vulnerable_correct"] for m in metrics_by_lang.values())
+        metrics_by_lang["all"] = {
+            "total_tasks": total_tasks,
+            "functional_correct": functional_correct,
+            "secure_given_correct": secure_given_correct,
+            "total_secure": total_secure,
+            "vulnerable_correct": vulnerable_correct
+        }
 
     # Print summary and compute percentages
     summary = {}

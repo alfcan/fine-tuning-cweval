@@ -20,11 +20,12 @@ import requests
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase 2 & 3: Preference Dataset Builder")
-    parser.add_argument("--model", type=str, default="qwen/qwen3-coder-30b", help="Model to query via LM Studio")
+    parser.add_argument("--model", type=str, default="openai/qwen/qwen3-coder-30b", help="Model to query via LM Studio")
     parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="LM Studio API base url")
+    parser.add_argument("--api_key", type=str, default="sk-local-research", help="LM Studio API key")
     parser.add_argument("--eval_base_dir", type=str, default="results/preference_gen", help="Directory for generations")
     parser.add_argument("--cweval_dir", type=str, default="CWEval", help="Path to cloned CWEval directory")
-    parser.add_argument("--docker", type=str, default="False", choices=["True", "False"], help="Run evaluation inside Docker")
+    parser.add_argument("--docker", type=str, default="True", choices=["True", "False"], help="Run evaluation inside Docker")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of parallel processes")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of samples to generate per temperature")
     parser.add_argument("--max_pairs_per_task", type=int, default=8, help="Maximum number of pairs to keep per task")
@@ -64,7 +65,13 @@ def check_func_and_sec(attempt):
 
 def run_command(cmd, cwd=None):
     print(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    env = os.environ.copy()
+    cweval_abs = os.path.abspath("CWEval")
+    if "PYTHONPATH" in env:
+        env["PYTHONPATH"] = cweval_abs + os.pathsep + env["PYTHONPATH"]
+    else:
+        env["PYTHONPATH"] = cweval_abs
+    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}", file=sys.stderr)
         print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
@@ -129,32 +136,39 @@ def rule_based_paraphrase(file_content, iteration):
 
 def main():
     args = parse_args()
-    cweval_path = Path(args.cweval_dir)
+    
+    # Configure API base and key in environment for litellm
+    if args.api_base:
+        os.environ["OPENAI_API_BASE"] = args.api_base
+        print(f"Set environment OPENAI_API_BASE={args.api_base}")
+    if args.api_key:
+        os.environ["OPENAI_API_KEY"] = args.api_key
+        print(f"Set environment OPENAI_API_KEY={args.api_key}")
+
+    cweval_path = Path(args.cweval_dir).resolve()
     if not cweval_path.exists():
         print(f"CWEval repository not found at {cweval_path}.", file=sys.stderr)
         sys.exit(1)
 
-    python_bench = cweval_path / "benchmark" / "python"
+    python_bench = cweval_path / "benchmark" / "core" / "py"
     if not python_bench.exists():
         print(f"Python benchmarks not found under {python_bench}", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Identify all Python tasks and select 25 tasks
-    cwe_dirs = sorted([d for d in python_bench.glob("cwe-*") if d.is_dir()])
+    # 1. Identify all Python tasks (exactly 25 tasks exist in the benchmark)
+    task_files = sorted(list(python_bench.glob("cwe_*_task.py")))
     all_tasks = []
-    for cwe_dir in cwe_dirs:
-        for task_dir in sorted(cwe_dir.glob("task_*")):
-            if task_dir.is_dir():
-                # Check for python files inside
-                py_files = list(task_dir.glob("*.py"))
-                if py_files:
-                    all_tasks.append({
-                        "task_id": f"python/{cwe_dir.name}/{task_dir.name}",
-                        "cwe": cwe_dir.name,
-                        "task_name": task_dir.name,
-                        "py_file": py_files[0],  # Main task stub
-                        "dir": task_dir
-                    })
+    for task_file in task_files:
+        task_name = task_file.name.replace("_task.py", "")
+        parts = task_name.split("_")
+        cwe_id = f"cwe-{parts[1]}"
+        all_tasks.append({
+            "task_id": f"core/py/{task_name}",
+            "cwe": cwe_id,
+            "task_name": task_name,
+            "py_file": task_file,
+            "dir": python_bench
+        })
 
     if len(all_tasks) < 25:
         print(f"Warning: Found only {len(all_tasks)} Python tasks. Using all of them.")
@@ -167,29 +181,6 @@ def main():
 
     selected_task_ids = {t["task_id"] for t in selected_tasks}
 
-    # 2. Back up other benchmarks and filter the benchmark directory
-    # To run generate.py only on selected tasks, we temporarily rename unselected tasks/languages
-    # We move them to a temporary directory outside benchmark
-    backup_dir = cweval_path / "benchmark_backup"
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir)
-    backup_dir.mkdir()
-
-    print("Backing up other benchmark languages and tasks to filter evaluation scope...")
-    # Move non-python folders
-    for lang_dir in (cweval_path / "benchmark").glob("*"):
-        if lang_dir.is_dir() and lang_dir.name != "python":
-            shutil.move(str(lang_dir), str(backup_dir / lang_dir.name))
-
-    # Move unselected python tasks
-    for cwe_dir in python_bench.glob("cwe-*"):
-        for task_dir in cwe_dir.glob("task_*"):
-            task_id = f"python/{cwe_dir.name}/{task_dir.name}"
-            if task_id not in selected_task_ids:
-                dest_cwe = backup_dir / "python" / cwe_dir.name
-                dest_cwe.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(task_dir), str(dest_cwe / task_dir.name))
-
     # We will build and store generated completions in memory mapped by task_id
     # task_id -> list of {"code": str, "func": bool, "sec": bool, "temp": float}
     task_completions = {t["task_id"]: [] for t in selected_tasks}
@@ -200,37 +191,44 @@ def main():
         with open(t["py_file"], "r") as f:
             task_prompts[t["task_id"]] = f.read()
 
-    temperatures = [0.4, 0.6, 0.8, 1.0]
+    temperatures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     
     try:
         # 3. Generate samples at multiple temperatures
         for temp in temperatures:
             print(f"\n--- Generating samples at temperature {temp} ---")
-            eval_path = Path(args.eval_base_dir) / f"temp_{temp}"
+            eval_path = Path(args.eval_base_dir).resolve() / f"temp_{temp}"
             if eval_path.exists():
                 shutil.rmtree(eval_path)
             
             gen_script = str(cweval_path / "cweval" / "generate.py")
             eval_script = str(cweval_path / "cweval" / "evaluate.py")
 
-            # Run generation
+            # Run generation (cwd must be CWEval for benchmark discovery)
             gen_cmd = [
                 sys.executable, gen_script, "gen",
                 "--model", args.model,
                 "--n", str(args.n_samples),
                 "--temperature", str(temp),
-                "--eval_path", str(eval_path)
+                "--eval_path", str(eval_path),
+                "--api_base", args.api_base,
+                "--api_key", args.api_key,
+                "--langs", "['py']"
             ]
-            run_command(gen_cmd)
+            run_command(gen_cmd, cwd=str(cweval_path))
 
             # Run evaluation
-            eval_cmd = [
-                sys.executable, eval_script, "pipeline",
-                "--eval_path", str(eval_path),
-                "--num_proc", str(args.num_proc),
-                "--docker", args.docker
-            ]
-            run_command(eval_cmd)
+            if args.docker == "True":
+                from cweval_orchestrator import run_evaluation_in_docker
+                run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+            else:
+                eval_cmd = [
+                    sys.executable, eval_script, "pipeline",
+                    "--eval_path", str(eval_path),
+                    "--num_proc", str(args.num_proc),
+                    "--docker", "False"
+                ]
+                run_command(eval_cmd, cwd=str(cweval_path))
 
             # Load results
             res_file = eval_path / "res_all.json"
@@ -244,27 +242,32 @@ def main():
             # For each task, map the files to the results
             for task in selected_tasks:
                 tid = task["task_id"]
-                if tid not in res_data:
+                
+                # The test file basename corresponding to this task
+                test_file_name = task["py_file"].name.replace("_task.py", "_test.py")
+                raw_file_name = task["py_file"].name.replace("_task.py", "_raw.py")
+                
+                # Find the key in res_all.json that ends with test_file_name
+                matching_key = None
+                for key in res_data.keys():
+                    if key.endswith(test_file_name):
+                        matching_key = key
+                        break
+                
+                if not matching_key:
                     continue
-
-                attempts = res_data[tid]
-                # Find all generated files in the evaluation output directory
-                # Naming should match evaluation output subfolder
-                task_out_dir = eval_path / "python" / task["cwe"] / task["task_name"]
-                if not task_out_dir.exists():
-                    continue
-
-                py_files = list(task_out_dir.glob("*.py"))
-                # Custom sort by number
-                def extract_num(p):
-                    nums = re.findall(r'\d+', p.name)
-                    return int(nums[0]) if nums else p.name
-                py_files.sort(key=extract_num)
-
-                for idx, attempt in enumerate(attempts):
-                    if idx < len(py_files):
-                        is_func, is_sec = check_func_and_sec(attempt)
-                        with open(py_files[idx], "r") as f:
+                    
+                attempts = res_data[matching_key]
+                n_samples = len(attempts.get("functional", []))
+                
+                for idx in range(n_samples):
+                    is_func = attempts["functional"][idx]
+                    is_sec = attempts["secure"][idx]
+                    
+                    # The file containing the generated code for this sample
+                    gen_file = eval_path / f"generated_{idx}" / "core" / "py" / raw_file_name
+                    if gen_file.exists():
+                        with open(gen_file, "r") as f:
                             code_content = f.read()
                         
                         task_completions[tid].append({
@@ -310,51 +313,36 @@ def main():
                 with open(task["py_file"], "w") as f:
                     f.write(paraphrased)
 
-                # Run generation and evaluation on this task
-                # To only run this task, we can keep only this task in benchmark (others temporarily moved)
-                # Let's temporarily move all other tasks out to run just this one
-                temp_isolate_dir = cweval_path / "benchmark_isolate"
-                if temp_isolate_dir.exists():
-                    shutil.rmtree(temp_isolate_dir)
-                temp_isolate_dir.mkdir()
-
-                # Move all tasks in benchmark/python except this one
-                for c_dir in python_bench.glob("cwe-*"):
-                    for t_dir in c_dir.glob("task_*"):
-                        if f"python/{c_dir.name}/{t_dir.name}" != tid:
-                            dest_iso = temp_isolate_dir / c_dir.name
-                            dest_iso.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(t_dir), str(dest_iso / t_dir.name))
-
-                eval_path = Path(args.eval_base_dir) / f"retry_{task['task_name']}_iter_{iter_idx}"
+                eval_path = Path(args.eval_base_dir).resolve() / f"retry_{task['task_name']}_iter_{iter_idx}"
                 if eval_path.exists():
                     shutil.rmtree(eval_path)
 
-                # Generate and evaluate
+                # Generate and evaluate (cwd must be CWEval for benchmark discovery)
+                # We filter generation to only run for this specific python task file
                 gen_cmd = [
                     sys.executable, str(cweval_path / "cweval" / "generate.py"), "gen",
                     "--model", args.model,
                     "--n", str(args.n_samples),
                     "--temperature", "0.8",  # high temp for retry diversity
-                    "--eval_path", str(eval_path)
-                ]
-                run_command(gen_cmd)
-
-                eval_cmd = [
-                    sys.executable, str(cweval_path / "cweval" / "evaluate.py"), "pipeline",
                     "--eval_path", str(eval_path),
-                    "--num_proc", str(args.num_proc),
-                    "--docker", args.docker
+                    "--api_base", args.api_base,
+                    "--api_key", args.api_key,
+                    "--langs", "['py']",
+                    "--include_path", f"['{task['task_name']}_task.py']"
                 ]
-                run_command(eval_cmd)
+                run_command(gen_cmd, cwd=str(cweval_path))
 
-                # Restore other python tasks from isolation
-                for c_dir in temp_isolate_dir.glob("cwe-*"):
-                    for t_dir in c_dir.glob("task_*"):
-                        dest_bench = python_bench / c_dir.name
-                        dest_bench.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(t_dir), str(dest_bench / t_dir.name))
-                shutil.rmtree(temp_isolate_dir)
+                if args.docker == "True":
+                    from cweval_orchestrator import run_evaluation_in_docker
+                    run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+                else:
+                    eval_cmd = [
+                        sys.executable, str(cweval_path / "cweval" / "evaluate.py"), "pipeline",
+                        "--eval_path", str(eval_path),
+                        "--num_proc", str(args.num_proc),
+                        "--docker", "False"
+                    ]
+                    run_command(eval_cmd, cwd=str(cweval_path))
 
                 # Parse and merge
                 res_file = eval_path / "res_all.json"
@@ -362,28 +350,37 @@ def main():
                     with open(res_file, "r") as f:
                         res_data = json.load(f)
                     
-                    if tid in res_data:
-                        attempts = res_data[tid]
-                        task_out_dir = eval_path / "python" / task["cwe"] / task["task_name"]
-                        if task_out_dir.exists():
-                            py_files = list(task_out_dir.glob("*.py"))
-                            def extract_num(p):
-                                nums = re.findall(r'\d+', p.name)
-                                return int(nums[0]) if nums else p.name
-                            py_files.sort(key=extract_num)
-
-                            for idx, attempt in enumerate(attempts):
-                                if idx < len(py_files):
-                                    is_func, is_sec = check_func_and_sec(attempt)
-                                    with open(py_files[idx], "r") as f:
-                                        code_content = f.read()
-                                    
-                                    task_completions[tid].append({
-                                        "code": code_content,
-                                        "func": is_func,
-                                        "sec": is_sec,
-                                        "temp": 0.8
-                                    })
+                    # The test file basename corresponding to this task
+                    test_file_name = task["py_file"].name.replace("_task.py", "_test.py")
+                    raw_file_name = task["py_file"].name.replace("_task.py", "_raw.py")
+                    
+                    # Find the key in res_all.json that ends with test_file_name
+                    matching_key = None
+                    for key in res_data.keys():
+                        if key.endswith(test_file_name):
+                            matching_key = key
+                            break
+                    
+                    if matching_key:
+                        attempts = res_data[matching_key]
+                        n_samples = len(attempts.get("functional", []))
+                        
+                        for idx in range(n_samples):
+                            is_func = attempts["functional"][idx]
+                            is_sec = attempts["secure"][idx]
+                            
+                            # The file containing the generated code for this sample
+                            gen_file = eval_path / f"generated_{idx}" / "core" / "py" / raw_file_name
+                            if gen_file.exists():
+                                with open(gen_file, "r") as f:
+                                    code_content = f.read()
+                                
+                                task_completions[tid].append({
+                                    "code": code_content,
+                                    "func": is_func,
+                                    "sec": is_sec,
+                                    "temp": 0.8
+                                })
 
                 # Check if we now have both secure and vuln
                 completions = task_completions[tid]
@@ -402,25 +399,7 @@ def main():
                 print(f"Paraphrasing retry loop failed to balance {tid}.")
 
     finally:
-        # Restore all benchmarks from backup
-        print("\nRestoring backup of other benchmarks and tasks...")
-        for lang_name in os.listdir(backup_dir):
-            src_lang = backup_dir / lang_name
-            if src_lang.is_dir() and lang_name != "python":
-                dest_lang = cweval_path / "benchmark" / lang_name
-                if dest_lang.exists():
-                    shutil.rmtree(dest_lang)
-                shutil.move(str(src_lang), str(dest_lang))
-            elif src_lang.is_dir() and lang_name == "python":
-                for c_dir in src_lang.glob("cwe-*"):
-                    for t_dir in c_dir.glob("task_*"):
-                        dest_t = python_bench / c_dir.name / t_dir.name
-                        dest_t.parent.mkdir(parents=True, exist_ok=True)
-                        if dest_t.exists():
-                            shutil.rmtree(dest_t)
-                        shutil.move(str(t_dir), str(dest_t))
-        
-        shutil.rmtree(backup_dir)
+        print("\nCompleted generation/evaluation attempts.")
 
     # 5. Pair Construction and Deduplication
     print("\n=== Constructing Preference Pairs ===")

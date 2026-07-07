@@ -29,6 +29,7 @@ Follow these steps sequentially to run the entire pilot study:
 Start your local OpenAI-compatible inference server (e.g., LM Studio or vLLM) hosting the base model:
 - **Model**: `qwen/qwen3-coder-30b` (or similar)
 - **API Endpoint**: `http://localhost:1234/v1`
+- **Model Identifier for LiteLLM**: Use the `openai/` prefix (e.g., `openai/qwen/qwen3-coder-30b`) to instruct LiteLLM to route calls via the OpenAI-compatible server.
 
 ---
 
@@ -37,12 +38,13 @@ Evaluate the untouched base model across all 5 programming languages in CWEval t
 
 ```bash
 python run_baseline.py \
-  --model "qwen/qwen3-coder-30b" \
+  --model "openai/qwen/qwen3-coder-30b" \
   --eval_path "results/baseline" \
-  --docker False \
+  --api_base "http://localhost:1234/v1" \
+  --api_key "sk-local-research" \
+  --docker True \
   --num_proc 8
 ```
-*Note: Set `--docker True` if you are running this from outside the official CWEval container to run tests securely.*
 
 ---
 
@@ -51,12 +53,13 @@ Query the model server at multiple temperatures to generate correct secure/vulne
 
 ```bash
 python build_preference_dataset.py \
-  --model "qwen/qwen3-coder-30b" \
+  --model "openai/qwen/qwen3-coder-30b" \
   --api_base "http://localhost:1234/v1" \
+  --api_key "sk-local-research" \
   --n_samples 10 \
   --max_pairs_per_task 8 \
   --train_split 0.8 \
-  --docker False
+  --docker True
 ```
 This produces `results/dataset/train_pairs.json` and `results/dataset/val_pairs.json` grouped by task (no task leakage).
 
@@ -83,8 +86,10 @@ Merge the trained adapter weights with the base model, and run comparative evalu
 
 ```bash
 python run_evaluation.py \
-  --model_id "qwen/qwen3-coder-30b" \
+  --model_id "openai/qwen/qwen3-coder-30b" \
   --seeds "42,123,456" \
+  --api_base "http://localhost:1234/v1" \
+  --api_key "sk-local-research" \
   --docker False
 ```
 This writes the aggregated stats to `results/eval_summary.json`.

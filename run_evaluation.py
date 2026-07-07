@@ -30,11 +30,19 @@ def parse_args():
     parser.add_argument("--seeds", type=str, default="42,123,456", help="Comma-separated random seeds used in training")
     parser.add_argument("--skip_merge", action="store_true", help="Skip the PEFT merge step")
     parser.add_argument("--bootstrap_samples", type=int, default=1000, help="Number of bootstrap resamples for CI")
+    parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="LM Studio API base url")
+    parser.add_argument("--api_key", type=str, default="sk-local-research", help="API key for inference server")
     return parser.parse_args()
 
 def run_command(cmd, cwd=None):
     print(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    env = os.environ.copy()
+    cweval_abs = os.path.abspath("CWEval")
+    if "PYTHONPATH" in env:
+        env["PYTHONPATH"] = cweval_abs + os.pathsep + env["PYTHONPATH"]
+    else:
+        env["PYTHONPATH"] = cweval_abs
+    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}", file=sys.stderr)
         print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
@@ -140,6 +148,15 @@ def bootstrap_ci(data, num_bootstraps=1000, ci=95):
 
 def main():
     args = parse_args()
+    
+    # Configure API base and key in environment for litellm
+    if args.api_base:
+        os.environ["OPENAI_API_BASE"] = args.api_base
+        print(f"Set environment OPENAI_API_BASE={args.api_base}")
+    if args.api_key:
+        os.environ["OPENAI_API_KEY"] = args.api_key
+        print(f"Set environment OPENAI_API_KEY={args.api_key}")
+        
     seeds = [int(s.strip()) for s in args.seeds.split(",")]
     
     # 1. Merge adapters if not skipped
@@ -187,6 +204,10 @@ def main():
         print(f"==========================================")
         
         eval_path = Path(args.eval_base_dir) / name
+        if eval_path.exists():
+            import shutil
+            shutil.rmtree(eval_path)
+        
         gen_script = str(Path(args.cweval_dir) / "cweval" / "generate.py")
         eval_script = str(Path(args.cweval_dir) / "cweval" / "evaluate.py")
 
@@ -196,7 +217,9 @@ def main():
             "--model", model_path,
             "--n", "1",
             "--temperature", "0.0",
-            "--eval_path", str(eval_path)
+            "--eval_path", str(eval_path),
+            "--api_base", args.api_base,
+            "--api_key", args.api_key
         ]
         run_command(gen_cmd)
 
