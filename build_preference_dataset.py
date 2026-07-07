@@ -180,6 +180,10 @@ def rule_based_paraphrase(file_content, iteration):
 def main():
     args = parse_args()
     
+    # Disable parallel tokenization and bypass macOS fork safety locks to prevent deadlocks
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+    
     # Configure API base and key in environment for litellm
     if args.api_base:
         os.environ["OPENAI_API_BASE"] = args.api_base
@@ -246,7 +250,7 @@ def main():
             if eval_path.exists():
                 shutil.rmtree(eval_path)
             
-            gen_script = str(cweval_path / "cweval" / "generate.py")
+            gen_script = str(Path("run_generation.py").resolve())
             eval_script = str(cweval_path / "cweval" / "evaluate.py")
 
             # Run generation (cwd must be CWEval for benchmark discovery)
@@ -258,7 +262,8 @@ def main():
                 "--eval_path", str(eval_path),
                 "--api_base", args.api_base,
                 "--api_key", args.api_key,
-                "--langs", "['py']"
+                "--langs", "['py']",
+                "--num_proc", str(args.num_proc)
             ]
             run_command(gen_cmd, cwd=str(cweval_path))
 
@@ -365,7 +370,7 @@ def main():
                 # Generate and evaluate (cwd must be CWEval for benchmark discovery)
                 # We filter generation to only run for this specific python task file
                 gen_cmd = [
-                    sys.executable, str(cweval_path / "cweval" / "generate.py"), "gen",
+                    sys.executable, str(Path("run_generation.py").resolve()), "gen",
                     "--model", args.model,
                     "--n", str(args.n_samples),
                     "--temperature", "0.8",  # high temp for retry diversity
@@ -373,7 +378,8 @@ def main():
                     "--api_base", args.api_base,
                     "--api_key", args.api_key,
                     "--langs", "['py']",
-                    "--include_path", f"['{task['task_name']}_task.py']"
+                    "--include_path", f"['{task['task_name']}_task.py']",
+                    "--num_proc", str(args.num_proc)
                 ]
                 run_command(gen_cmd, cwd=str(cweval_path))
 

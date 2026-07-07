@@ -126,6 +126,10 @@ def run_command(cmd, cwd=None):
 def main():
     args = parse_args()
     
+    # Disable parallel tokenization and bypass macOS fork safety locks to prevent deadlocks
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+    
     # Configure API base and key in environment for litellm
     if args.api_base:
         os.environ["OPENAI_API_BASE"] = args.api_base
@@ -158,8 +162,8 @@ def main():
             print(f"Clearing existing evaluation directory: {eval_path_abs}")
             shutil.rmtree(eval_dir)
         
-        # 1. Run generation using CWEval's script (cwd must be CWEval for benchmark discovery)
-        gen_script = str(cweval_path / "cweval" / "generate.py")
+        # 1. Run generation using our wrapper script (cwd must be CWEval for benchmark discovery)
+        gen_script = str(Path("run_generation.py").resolve())
         gen_cmd = [
             sys.executable, gen_script, "gen",
             "--model", args.model,
@@ -167,7 +171,8 @@ def main():
             "--eval_path", eval_path_abs,
             "--temperature", "0.0",
             "--api_base", args.api_base,
-            "--api_key", args.api_key
+            "--api_key", args.api_key,
+            "--num_proc", str(args.num_proc)
         ]
         run_command(gen_cmd, cwd=str(cweval_path))
         

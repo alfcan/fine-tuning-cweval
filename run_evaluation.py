@@ -121,7 +121,7 @@ def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
         
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_id_clean,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="cpu",
             trust_remote_code=True
         )
@@ -196,6 +196,10 @@ def bootstrap_ci(data, num_bootstraps=1000, ci=95):
 def main():
     args = parse_args()
     
+    # Disable parallel tokenization and bypass macOS fork safety locks to prevent deadlocks
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+    
     # Configure API base and key in environment for litellm
     if args.api_base:
         os.environ["OPENAI_API_BASE"] = args.api_base
@@ -257,7 +261,7 @@ def main():
                 import shutil
                 shutil.rmtree(eval_path)
             
-            gen_script = str(Path(args.cweval_dir) / "cweval" / "generate.py")
+            gen_script = str(Path("run_generation.py").resolve())
             eval_script = str(Path(args.cweval_dir) / "cweval" / "evaluate.py")
 
             # Run generation
@@ -268,7 +272,8 @@ def main():
                 "--temperature", "0.0",
                 "--eval_path", str(eval_path),
                 "--api_base", args.api_base,
-                "--api_key", args.api_key
+                "--api_key", args.api_key,
+                "--num_proc", str(args.num_proc)
             ]
             run_command(gen_cmd)
 

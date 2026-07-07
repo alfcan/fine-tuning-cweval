@@ -128,7 +128,7 @@ if __name__ == "__main__":
     print(f"Using device: {device} with dtype: {dtype}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=dtype,
+        dtype=dtype,
         trust_remote_code=True
     ).to(device)
     model.eval()

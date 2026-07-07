@@ -125,7 +125,7 @@ def main():
             args.model_id,
             quantization_config=bnb_config,
             device_map=device_map,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
             trust_remote_code=True
         )
 
