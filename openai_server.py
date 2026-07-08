@@ -43,6 +43,7 @@ async def chat_completions(request: Request):
         temperature = data.get("temperature", 0.7)
         max_tokens = data.get("max_tokens", 512)
         stop_words = data.get("stop", [])
+        n = int(data.get("n", 1))
 
         # Apply chat template
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -56,25 +57,48 @@ async def chat_completions(request: Request):
         }
         if do_sample:
             gen_kwargs["temperature"] = temperature
+            if n > 1:
+                gen_kwargs["num_return_sequences"] = n
 
         # Generate completions
         with torch.no_grad():
             outputs = model.generate(**inputs, **gen_kwargs)
         
         input_len = inputs["input_ids"].shape[1]
-        generated_tokens = outputs[0][input_len:]
-        response_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
-        # Post-process stopping criteria at text level
-        if isinstance(stop_words, str):
-            stop_words = [stop_words]
-        if stop_words:
-            first_stop_idx = len(response_text)
-            for stop_word in stop_words:
-                idx = response_text.find(stop_word)
-                if idx != -1 and idx < first_stop_idx:
-                    first_stop_idx = idx
-            response_text = response_text[:first_stop_idx]
+        # If we got 1 output sequence but n > 1 (e.g. because do_sample was False),
+        # we replicate the output sequence n times.
+        if outputs.shape[0] == 1 and n > 1:
+            output_sequences = [outputs[0]] * n
+        else:
+            output_sequences = [outputs[idx] for idx in range(outputs.shape[0])]
+            
+        choices = []
+        total_completion_tokens = 0
+        for idx, seq in enumerate(output_sequences):
+            generated_tokens = seq[input_len:]
+            total_completion_tokens += len(generated_tokens)
+            response_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            
+            # Post-process stopping criteria at text level
+            if isinstance(stop_words, str):
+                stop_words = [stop_words]
+            if stop_words:
+                first_stop_idx = len(response_text)
+                for stop_word in stop_words:
+                    idx_stop = response_text.find(stop_word)
+                    if idx_stop != -1 and idx_stop < first_stop_idx:
+                        first_stop_idx = idx_stop
+                response_text = response_text[:first_stop_idx]
+                
+            choices.append({
+                "index": idx,
+                "message": {
+                    "role": "assistant",
+                    "content": response_text
+                },
+                "finish_reason": "stop"
+            })
 
         completion_id = f"chatcmpl-{uuid.uuid4()}"
         return {
@@ -82,20 +106,11 @@ async def chat_completions(request: Request):
             "object": "chat.completion",
             "created": int(time.time()),
             "model": data.get("model", "local-model"),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response_text
-                    },
-                    "finish_reason": "stop"
-                }
-            ],
+            "choices": choices,
             "usage": {
                 "prompt_tokens": input_len,
-                "completion_tokens": len(generated_tokens),
-                "total_tokens": input_len + len(generated_tokens)
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": input_len + total_completion_tokens
             }
         }
     except Exception as e:

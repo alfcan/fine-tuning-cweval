@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--eval_base_dir", type=str, default="results/preference_gen", help="Directory for generations")
     parser.add_argument("--cweval_dir", type=str, default="CWEval", help="Path to cloned CWEval directory")
     parser.add_argument("--docker", type=str, default="True", choices=["True", "False"], help="Run evaluation inside Docker")
-    parser.add_argument("--num_proc", type=int, default=8, help="Number of parallel processes")
+    parser.add_argument("--num_proc", type=int, default=1, help="Number of parallel processes")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of samples to generate per temperature")
     parser.add_argument("--max_pairs_per_task", type=int, default=8, help="Maximum number of pairs to keep per task")
     parser.add_argument("--train_split", type=float, default=0.8, help="Fraction of tasks to assign to train set")
@@ -238,7 +238,7 @@ def main():
         with open(t["py_file"], "r") as f:
             task_prompts[t["task_id"]] = f.read()
 
-    temperatures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    temperatures = [0.4, 0.6, 0.8, 1.0]
     
     # Start the local model server
     server_proc = start_local_server(args.model, args.api_base)

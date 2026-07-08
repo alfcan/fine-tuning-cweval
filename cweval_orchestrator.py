@@ -12,6 +12,11 @@ sys.path.insert(0, str(cweval_path))
 from cweval.sandbox import Container
 
 def run_evaluation_in_docker(eval_path, num_proc=8):
+    # Configure Docker Desktop socket on macOS if present
+    mac_docker_sock = os.path.expanduser("~/.docker/run/docker.sock")
+    if os.path.exists(mac_docker_sock):
+        os.environ["DOCKER_HOST"] = f"unix://{mac_docker_sock}"
+
     # Absolute path on host
     eval_path_abs = Path(eval_path).resolve()
     
@@ -21,8 +26,7 @@ def run_evaluation_in_docker(eval_path, num_proc=8):
     print(f"Starting Docker container (co1lin/cweval) named {container_name}...")
     container = Container(
         image='co1lin/cweval',
-        name=container_name,
-        user='ubuntu',
+        name=container_name
     )
     
     try:
