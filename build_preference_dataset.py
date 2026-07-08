@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--eval_base_dir", type=str, default="results/preference_gen", help="Directory for generations")
     parser.add_argument("--cweval_dir", type=str, default="CWEval", help="Path to cloned CWEval directory")
     parser.add_argument("--docker", type=str, default="True", choices=["True", "False"], help="Run evaluation inside Docker")
-    parser.add_argument("--num_proc", type=int, default=1, help="Number of parallel processes")
+    parser.add_argument("--num_proc", type=int, default=8, help="Number of parallel processes")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of samples to generate per temperature")
     parser.add_argument("--max_pairs_per_task", type=int, default=8, help="Maximum number of pairs to keep per task")
     parser.add_argument("--train_split", type=float, default=0.8, help="Fraction of tasks to assign to train set")
@@ -177,6 +177,43 @@ def rule_based_paraphrase(file_content, iteration):
             return f"{parts[0]}\"\"\"{parts[1]}\n{note.strip()}\"\"\"{parts[2]}"
     return file_content + note
 
+def check_evaluation_complete(eval_path, selected_tasks, n_samples):
+    if (Path(eval_path) / "evaluation_run.marker").exists():
+        return True
+    res_file = Path(eval_path) / "res_all.json"
+    if not res_file.exists():
+        return False
+    try:
+        with open(res_file, "r") as f:
+            res_data = json.load(f)
+        
+        for task in selected_tasks:
+            test_file_name = task["py_file"].name.replace("_task.py", "_test.py")
+            matching_key = None
+            for key in res_data.keys():
+                if key.endswith(test_file_name):
+                    matching_key = key
+                    break
+            if not matching_key:
+                return False
+            attempts = res_data[matching_key]
+            if "functional" not in attempts or "secure" not in attempts:
+                return False
+        return True
+    except Exception:
+        return False
+
+def check_generation_complete(eval_path, selected_tasks, n_samples):
+    if not Path(eval_path).exists():
+        return False
+    for task in selected_tasks:
+        raw_file_name = task["py_file"].name.replace("_task.py", "_raw.py")
+        for idx in range(n_samples):
+            gen_file = Path(eval_path) / f"generated_{idx}" / "core" / "py" / raw_file_name
+            if not gen_file.exists():
+                return False
+    return True
+
 def main():
     args = parse_args()
     
@@ -207,6 +244,9 @@ def main():
     all_tasks = []
     for task_file in task_files:
         task_name = task_file.name.replace("_task.py", "")
+        if task_name in ["cwe_918_0", "cwe_918_1"]:
+            print(f"Skipping task '{task_name}' as requested.")
+            continue
         parts = task_name.split("_")
         cwe_id = f"cwe-{parts[1]}"
         all_tasks.append({
@@ -245,40 +285,54 @@ def main():
     try:
         # 3. Generate samples at multiple temperatures
         for temp in temperatures:
-            print(f"\n--- Generating samples at temperature {temp} ---")
+            print(f"\n--- Generating/Evaluating samples at temperature {temp} ---")
             eval_path = Path(args.eval_base_dir).resolve() / f"temp_{temp}"
-            if eval_path.exists():
-                shutil.rmtree(eval_path)
             
-            gen_script = str(Path("run_generation.py").resolve())
-            eval_script = str(cweval_path / "cweval" / "evaluate.py")
-
-            # Run generation (cwd must be CWEval for benchmark discovery)
-            gen_cmd = [
-                sys.executable, gen_script, "gen",
-                "--model", args.model,
-                "--n", str(args.n_samples),
-                "--temperature", str(temp),
-                "--eval_path", str(eval_path),
-                "--api_base", args.api_base,
-                "--api_key", args.api_key,
-                "--langs", "['py']",
-                "--num_proc", str(args.num_proc)
-            ]
-            run_command(gen_cmd, cwd=str(cweval_path))
-
-            # Run evaluation
-            if args.docker == "True":
-                from cweval_orchestrator import run_evaluation_in_docker
-                run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+            is_eval_done = check_evaluation_complete(eval_path, selected_tasks, args.n_samples)
+            is_gen_done = check_generation_complete(eval_path, selected_tasks, args.n_samples)
+            
+            if is_eval_done:
+                print(f"Evaluation for temp {temp} is already complete (res_all.json exists and is valid). Skipping generation and evaluation.")
             else:
-                eval_cmd = [
-                    sys.executable, eval_script, "pipeline",
-                    "--eval_path", str(eval_path),
-                    "--num_proc", str(args.num_proc),
-                    "--docker", "False"
-                ]
-                run_command(eval_cmd, cwd=str(cweval_path))
+                if is_gen_done:
+                    print(f"All generations for temp {temp} already exist. Skipping generation, running evaluation.")
+                else:
+                    print(f"Generations for temp {temp} are missing or incomplete. Running generation...")
+                    gen_script = str(Path("run_generation.py").resolve())
+                    gen_cmd = [
+                        sys.executable, gen_script, "gen",
+                        "--model", args.model,
+                        "--n", str(args.n_samples),
+                        "--temperature", str(temp),
+                        "--eval_path", str(eval_path),
+                        "--api_base", args.api_base,
+                        "--api_key", args.api_key,
+                        "--langs", "['py']",
+                        "--num_proc", str(args.num_proc)
+                    ]
+                    run_command(gen_cmd, cwd=str(cweval_path))
+                
+                print(f"Running evaluation pipeline for temp {temp}...")
+                try:
+                    eval_script = str(cweval_path / "cweval" / "evaluate.py")
+                    if args.docker == "True":
+                        from cweval_orchestrator import run_evaluation_in_docker
+                        run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+                    else:
+                        eval_cmd = [
+                            sys.executable, eval_script, "pipeline",
+                            "--eval_path", str(eval_path),
+                            "--num_proc", str(args.num_proc),
+                            "--docker", "False"
+                        ]
+                        run_command(eval_cmd, cwd=str(cweval_path))
+                except Exception as e:
+                    print(f"Warning: Evaluation pipeline failed for temp {temp}: {e}")
+                finally:
+                    try:
+                        (Path(eval_path) / "evaluation_run.marker").touch()
+                    except Exception:
+                        pass
 
             # Load results
             res_file = eval_path / "res_all.json"
@@ -364,36 +418,53 @@ def main():
                     f.write(paraphrased)
 
                 eval_path = Path(args.eval_base_dir).resolve() / f"retry_{task['task_name']}_iter_{iter_idx}"
-                if eval_path.exists():
-                    shutil.rmtree(eval_path)
-
-                # Generate and evaluate (cwd must be CWEval for benchmark discovery)
-                # We filter generation to only run for this specific python task file
-                gen_cmd = [
-                    sys.executable, str(Path("run_generation.py").resolve()), "gen",
-                    "--model", args.model,
-                    "--n", str(args.n_samples),
-                    "--temperature", "0.8",  # high temp for retry diversity
-                    "--eval_path", str(eval_path),
-                    "--api_base", args.api_base,
-                    "--api_key", args.api_key,
-                    "--langs", "['py']",
-                    "--include_path", f"['{task['task_name']}_task.py']",
-                    "--num_proc", str(args.num_proc)
-                ]
-                run_command(gen_cmd, cwd=str(cweval_path))
-
-                if args.docker == "True":
-                    from cweval_orchestrator import run_evaluation_in_docker
-                    run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+                
+                is_eval_done = check_evaluation_complete(eval_path, [task], args.n_samples)
+                is_gen_done = check_generation_complete(eval_path, [task], args.n_samples)
+                
+                if is_eval_done:
+                    print(f"Evaluation for retry {task['task_name']} iter {iter_idx} is already complete. Skipping generation and evaluation.")
                 else:
-                    eval_cmd = [
-                        sys.executable, str(cweval_path / "cweval" / "evaluate.py"), "pipeline",
-                        "--eval_path", str(eval_path),
-                        "--num_proc", str(args.num_proc),
-                        "--docker", "False"
-                    ]
-                    run_command(eval_cmd, cwd=str(cweval_path))
+                    if is_gen_done:
+                        print(f"All generations for retry {task['task_name']} iter {iter_idx} already exist. Skipping generation, running evaluation.")
+                    else:
+                        print(f"Generations for retry {task['task_name']} iter {iter_idx} are missing/incomplete. Running generation...")
+                        # Generate and evaluate (cwd must be CWEval for benchmark discovery)
+                        # We filter generation to only run for this specific python task file
+                        gen_cmd = [
+                            sys.executable, str(Path("run_generation.py").resolve()), "gen",
+                            "--model", args.model,
+                            "--n", str(args.n_samples),
+                            "--temperature", "0.8",  # high temp for retry diversity
+                            "--eval_path", str(eval_path),
+                            "--api_base", args.api_base,
+                            "--api_key", args.api_key,
+                            "--langs", "['py']",
+                            "--include_path", f"['{task['task_name']}_task.py']",
+                            "--num_proc", str(args.num_proc)
+                        ]
+                        run_command(gen_cmd, cwd=str(cweval_path))
+
+                    print(f"Running evaluation pipeline for retry {task['task_name']} iter {iter_idx}...")
+                    try:
+                        if args.docker == "True":
+                            from cweval_orchestrator import run_evaluation_in_docker
+                            run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+                        else:
+                            eval_cmd = [
+                                sys.executable, str(cweval_path / "cweval" / "evaluate.py"), "pipeline",
+                                "--eval_path", str(eval_path),
+                                "--num_proc", str(args.num_proc),
+                                "--docker", "False"
+                            ]
+                            run_command(eval_cmd, cwd=str(cweval_path))
+                    except Exception as e:
+                        print(f"Warning: Evaluation pipeline failed for retry {task['task_name']} iter {iter_idx}: {e}")
+                    finally:
+                        try:
+                            (Path(eval_path) / "evaluation_run.marker").touch()
+                        except Exception:
+                            pass
 
                 # Parse and merge
                 res_file = eval_path / "res_all.json"
