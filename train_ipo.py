@@ -32,13 +32,14 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="results/checkpoints", help="Where to save model checkpoints")
     parser.add_argument("--seeds", type=str, default="42,123,456", help="Comma-separated random seeds for training")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--beta", type=float, default=0.5, help="IPO/DPO beta parameter (controls preference strength)")
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha scaling factor")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
-    parser.add_argument("--epochs", type=int, default=3, help="Max number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=5, help="Max number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Per-device train batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--quant_4bit", type=str, default="False", choices=["True", "False"], help="Load model in 4-bit QLoRA")
-    parser.add_argument("--early_stopping_patience", type=int, default=1, help="Patience for early stopping")
+    parser.add_argument("--early_stopping_patience", type=int, default=3, help="Patience for early stopping")
     return parser.parse_args()
 
 def load_json_dataset(file_path):
@@ -136,7 +137,9 @@ def main():
         # Load Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model_id)
         if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            # Use a dedicated pad token instead of eos_token to preserve EOS semantics during generation
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            print("Added dedicated <|pad|> token to tokenizer.")
 
         # Load Model
         print(f"Loading base model {args.model_id}...")
@@ -150,6 +153,10 @@ def main():
             load_kwargs["device_map"] = device_map
 
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **load_kwargs)
+
+        # Resize embeddings if we added a new pad token
+        if len(tokenizer) > model.config.vocab_size:
+            model.resize_token_embeddings(len(tokenizer))
 
         # Move to MPS if needed
         if torch.backends.mps.is_available() and device_map is None:
@@ -174,19 +181,19 @@ def main():
         training_args = DPOConfig(
             output_dir=str(seed_output_dir),
             loss_type="ipo",
-            beta=0.1,  # IPO weight parameter
-            max_length=512,  # Cap sequence length to save memory
+            beta=args.beta,  # IPO: target offset = 1/(2*beta). beta=0.5 → target=1.0 (reachable)
+            label_smoothing=0.1,  # Regularizes preference signal on small datasets
+            max_length=1024,  # Increased from 512 to avoid truncating code completions
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             gradient_checkpointing=True,  # Saves significant memory
             learning_rate=args.learning_rate,
+            weight_decay=0.05,  # L2 regularization to prevent overfitting
             num_train_epochs=args.epochs,
-            eval_strategy="steps",
-            eval_steps=10,
-            save_strategy="steps",
-            save_steps=10,
-            logging_steps=5,
+            eval_strategy="epoch",  # Epoch-based eval is more stable on tiny datasets
+            save_strategy="epoch",
+            logging_steps=1,  # Log every step for detailed monitoring
             warmup_ratio=0.1,
             lr_scheduler_type="cosine",
             load_best_model_at_end=True,
