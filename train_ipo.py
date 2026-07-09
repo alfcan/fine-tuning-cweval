@@ -26,6 +26,7 @@ preference pairs (on-policy) and used later for evaluation.
 
 import sys
 import json
+import inspect
 import argparse
 import statistics
 from pathlib import Path
@@ -303,7 +304,11 @@ def main():
             task_type="CAUSAL_LM",
         )
 
-        training_args = DPOConfig(
+        # Build the config as a dict, then filter out any kwarg not supported
+        # by the installed TRL version (param names move across TRL releases,
+        # e.g. max_prompt_length). Unsupported keys are dropped with a warning
+        # instead of crashing.
+        config_kwargs = dict(
             output_dir=str(seed_dir),
             loss_type="ipo",
             beta=args.beta,
@@ -335,6 +340,18 @@ def main():
             remove_unused_columns=False,
             seed=seed,
             report_to="none",
+        )
+        supported = set(inspect.signature(DPOConfig.__init__).parameters)
+        dropped = sorted(k for k in config_kwargs if k not in supported)
+        if dropped:
+            print(
+                f"[WARN] Installed TRL's DPOConfig does not support: {dropped}. "
+                f"Dropping them. Check your TRL version (pip show trl) — "
+                f"if 'max_prompt_length' was dropped, long prompts will only be "
+                f"truncated by max_length."
+            )
+        training_args = DPOConfig(
+            **{k: v for k, v in config_kwargs.items() if k in supported}
         )
 
         trainer = DPOTrainer(
