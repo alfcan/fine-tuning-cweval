@@ -14,7 +14,7 @@ import argparse
 import random
 import difflib
 import subprocess
-import shutil
+
 from pathlib import Path
 import litellm
 
@@ -208,8 +208,6 @@ def main():
     # We will generate n_candidates secure and n_candidates vulnerable completions
     # We map them to directories generated_0 to generated_{2*n_candidates - 1}
     eval_path = Path(args.eval_base_dir).resolve() / "supplement_run"
-    if eval_path.exists():
-        shutil.rmtree(eval_path)
     eval_path.mkdir(parents=True, exist_ok=True)
 
     # Extract the prompt for each task as understood by CWEval
@@ -228,6 +226,20 @@ def main():
         if not begin_solution_line_src:
             continue
             
+        raw_file_name = task["py_file"].name.replace("_task.py", "_raw.py")
+
+        # Check if generated files already exist for this task (resume support)
+        all_gen_exist = True
+        for idx in range(2 * args.n_candidates):
+            gen_file = eval_path / f"generated_{idx}" / "core" / "py" / raw_file_name
+            if not gen_file.exists():
+                all_gen_exist = False
+                break
+
+        if all_gen_exist:
+            print(f"\nSkipping generation for {tid}: all {2 * args.n_candidates} candidate files already exist.")
+            continue
+
         code_prompt = (
             task_code.split('BEGIN PROMPT')[-1]
             .split(begin_solution_line_src)[0]
@@ -251,8 +263,6 @@ def main():
         secure_completions = query_model(args.api_base, args.api_key, args.model, secure_msgs, args.temp, args.n_candidates)
         vuln_completions = query_model(args.api_base, args.api_key, args.model, vuln_msgs, args.temp, args.n_candidates)
 
-        raw_file_name = task["py_file"].name.replace("_task.py", "_raw.py")
-
         # Save secure completions: generated_0 to generated_{n_candidates-1}
         for idx, comp in enumerate(secure_completions):
             formatted_code = clean_extracted_code(comp)
@@ -269,33 +279,45 @@ def main():
             with open(out_file, "w") as f:
                 f.write(formatted_code)
 
-    # 6. Run evaluation
-    print("\nRunning evaluation on generated candidates...")
-    try:
-        eval_script = str(cweval_path / "cweval" / "evaluate.py")
-        if args.docker == "True":
-            from cweval_orchestrator import run_evaluation_in_docker
-            run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
-        else:
-            eval_cmd = [
-                sys.executable, eval_script, "pipeline",
-                "--eval_path", str(eval_path),
-                "--num_proc", str(args.num_proc),
-                "--docker", "False"
-            ]
-            run_command(eval_cmd, cwd=str(cweval_path))
-    except Exception as e:
-        print(f"Evaluation failed: {e}")
-        sys.exit(1)
+    # 6. Run evaluation (skip if results already exist)
+    res_file = eval_path / "res_all.json"
+    if res_file.exists():
+        print(f"\nEvaluation results already exist at {res_file}. Skipping evaluation.")
+    else:
+        print("\nRunning evaluation on generated candidates...")
+        try:
+            eval_script = str(cweval_path / "cweval" / "evaluate.py")
+            if args.docker == "True":
+                from cweval_orchestrator import run_evaluation_in_docker
+                run_evaluation_in_docker(eval_path, num_proc=args.num_proc)
+            else:
+                eval_cmd = [
+                    sys.executable, eval_script, "pipeline",
+                    "--eval_path", str(eval_path),
+                    "--num_proc", str(args.num_proc),
+                    "--docker", "False"
+                ]
+                run_command(eval_cmd, cwd=str(cweval_path))
+        except Exception as e:
+            print(f"Evaluation failed: {e}")
+            sys.exit(1)
 
     # 7. Parse results and build supplemented pairs
-    res_file = eval_path / "res_all.json"
     if not res_file.exists():
         print(f"Error: Evaluation results file not found at {res_file}", file=sys.stderr)
         sys.exit(1)
 
     with open(res_file, "r") as f:
         res_data = json.load(f)
+
+    # Build a set of all existing pair signatures to prevent re-adding duplicates
+    # (covers the case where pairs were already generated, evaluated, and merged
+    #  in a previous run of this script)
+    existing_pair_signatures = set()
+    for pair in train_pairs + val_pairs:
+        norm_c = normalize_code(pair["chosen"])
+        norm_r = normalize_code(pair["rejected"])
+        existing_pair_signatures.add((norm_c, norm_r))
 
     supplemented_pairs_by_task = {}
 
@@ -381,21 +403,17 @@ def main():
                 final_unique_vuln.append(v)
 
         # Re-construct pairs prioritising existing pairs first
-        existing_set = set()
-        for p in existing_pairs_by_task[tid]:
-            norm_c = normalize_code(p["chosen"])
-            norm_r = normalize_code(p["rejected"])
-            existing_set.add((norm_c, norm_r))
-
+        # Use the global signature set to catch pairs already in the dataset
+        # (including those added by a previous run of this script)
         task_pairs = list(existing_pairs_by_task[tid])
         
-        # Add new combinations
+        # Add new combinations (skip any pair whose signature already exists globally)
         new_constructed_pairs = []
         for sc in final_unique_sec:
             for vc in final_unique_vuln:
                 norm_sc = normalize_code(sc)
                 norm_vc = normalize_code(vc)
-                if (norm_sc, norm_vc) not in existing_set:
+                if (norm_sc, norm_vc) not in existing_pair_signatures:
                     new_constructed_pairs.append({
                         "prompt": task_prompts[tid],
                         "chosen": sc,
