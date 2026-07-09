@@ -71,7 +71,6 @@ Train LoRA/PEFT adapters with TRL's `DPOTrainer` (using the IPO loss) across 3 i
 python train_ipo.py \
   --model_id "Qwen/Qwen3.5-2B" \
   --dataset_dir "results/dataset" \
-  --seeds "42,123,456" \
   --epochs 3 \
   --batch_size 4 \
   --quant_4bit False
@@ -86,7 +85,7 @@ Merge the trained adapter weights with the base model, and run comparative evalu
 ```bash
 python run_evaluation.py \
   --model_id "openai/Qwen/Qwen3.5-2B" \
-  --seeds "42,123,456" \
+  --seeds 42 \
   --api_base "http://localhost:1234/v1" \
   --api_key "sk-local-research" \
   --docker False

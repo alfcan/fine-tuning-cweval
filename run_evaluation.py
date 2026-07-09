@@ -245,7 +245,7 @@ def main():
     # We will evaluate the base model and each seed model
     models_to_eval = {"base": args.model_id}
     for seed in seeds:
-        models_to_eval[f"seed_{seed}"] = str(Path(args.merged_dir) / f"seed_{seed}")
+        models_to_eval[f"seed_{seed}"] = "openai/" + str(Path(args.merged_dir) / f"seed_{seed}")
 
     eval_results = {}
 
@@ -256,13 +256,11 @@ def main():
         
         server_proc = start_local_server(model_path, args.api_base)
         try:
-            eval_path = Path(args.eval_base_dir) / name
-            if eval_path.exists():
-                import shutil
-                shutil.rmtree(eval_path)
+            eval_path = (Path(args.eval_base_dir) / name).resolve()
+            # We don't delete the directory here so that run_generation.py can skip/resume already generated samples.
             
             gen_script = str(Path("run_generation.py").resolve())
-            eval_script = str(Path(args.cweval_dir) / "cweval" / "evaluate.py")
+            eval_script = str(Path(args.cweval_dir).resolve() / "cweval" / "evaluate.py")
 
             # Run generation
             gen_cmd = [
@@ -275,16 +273,20 @@ def main():
                 "--api_key", args.api_key,
                 "--num_proc", str(args.num_proc)
             ]
-            run_command(gen_cmd)
+            run_command(gen_cmd, cwd=args.cweval_dir)
 
             # Run evaluation pipeline
-            eval_cmd = [
-                sys.executable, eval_script, "pipeline",
-                "--eval_path", str(eval_path),
-                "--num_proc", str(args.num_proc),
-                "--docker", args.docker
-            ]
-            run_command(eval_cmd)
+            if args.docker == "True":
+                from cweval_orchestrator import run_evaluation_in_docker
+                run_evaluation_in_docker(str(eval_path), num_proc=args.num_proc)
+            else:
+                eval_cmd = [
+                    sys.executable, eval_script, "pipeline",
+                    "--eval_path", str(eval_path),
+                    "--num_proc", str(args.num_proc),
+                    "--docker", "False"
+                ]
+                run_command(eval_cmd, cwd=args.cweval_dir)
         finally:
             print("Stopping local model server...")
             server_proc.terminate()

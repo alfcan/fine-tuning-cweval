@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha scaling factor")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=3, help="Max number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Per-device train batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Per-device train batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--quant_4bit", type=str, default="False", choices=["True", "False"], help="Load model in 4-bit QLoRA")
     parser.add_argument("--early_stopping_patience", type=int, default=1, help="Patience for early stopping")
@@ -92,17 +92,36 @@ def main():
     val_dataset = load_json_dataset(val_file)
     print(f"Loaded {len(train_dataset)} train pairs and {len(val_dataset)} val pairs.")
 
-    # Base model setup
-    device_map = "auto"
+    # Detect device
+    if torch.cuda.is_available():
+        device_map = "auto"
+        model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        use_fp16 = not torch.cuda.is_bf16_supported()
+        use_bf16 = torch.cuda.is_bf16_supported()
+    elif torch.backends.mps.is_available():
+        device_map = None  # We'll move manually
+        model_dtype = torch.float32  # MPS doesn't support fp16/bf16 training reliably
+        use_fp16 = False
+        use_bf16 = False
+        print("Detected Apple Silicon (MPS). Using float32 for training.")
+    else:
+        device_map = None
+        model_dtype = torch.float32
+        use_fp16 = False
+        use_bf16 = False
+
     bnb_config = None
     if args.quant_4bit == "True":
-        print("Configuring QLoRA 4-bit bitsandbytes...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-            bnb_4bit_use_double_quant=True
-        )
+        if not torch.cuda.is_available():
+            print("Warning: 4-bit quantization requires CUDA. Skipping QLoRA on this device.")
+        else:
+            print("Configuring QLoRA 4-bit bitsandbytes...")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                bnb_4bit_use_double_quant=True
+            )
 
     # 5. Loop over independent seeds
     for seed in seeds:
@@ -121,15 +140,22 @@ def main():
 
         # Load Model
         print(f"Loading base model {args.model_id}...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-            trust_remote_code=True
+        load_kwargs = dict(
+            trust_remote_code=True,
+            dtype=model_dtype,
         )
+        if bnb_config is not None:
+            load_kwargs["quantization_config"] = bnb_config
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
 
-        if args.quant_4bit == "True":
+        model = AutoModelForCausalLM.from_pretrained(args.model_id, **load_kwargs)
+
+        # Move to MPS if needed
+        if torch.backends.mps.is_available() and device_map is None:
+            model = model.to("mps")
+
+        if args.quant_4bit == "True" and bnb_config is not None:
             model = prepare_model_for_kbit_training(model)
 
         # Configure PEFT / LoRA
@@ -149,12 +175,14 @@ def main():
             output_dir=str(seed_output_dir),
             loss_type="ipo",
             beta=0.1,  # IPO weight parameter
+            max_length=512,  # Cap sequence length to save memory
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
+            gradient_checkpointing=True,  # Saves significant memory
             learning_rate=args.learning_rate,
             num_train_epochs=args.epochs,
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             eval_steps=10,
             save_strategy="steps",
             save_steps=10,
@@ -164,8 +192,9 @@ def main():
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
-            fp16=not torch.cuda.is_bf16_supported(),
-            bf16=torch.cuda.is_bf16_supported(),
+            fp16=use_fp16,
+            bf16=use_bf16,
+            dataloader_pin_memory=False,  # Not supported on MPS
             remove_unused_columns=False,  # Important for DPOTrainer
             seed=seed,
             report_to="none"
@@ -176,10 +205,9 @@ def main():
             model=model,
             ref_model=None,  # Set to None to automatically use base model with adapter disabled
             args=training_args,
-            beta=0.1,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             peft_config=peft_config,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)]
         )
@@ -207,6 +235,8 @@ def main():
         del trainer
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     print("\n=== All Seeds Completed Successfully! ===")
 
