@@ -77,7 +77,9 @@ def parse_args():
     p.add_argument("--max_prompt_length", type=int, default=512)
     p.add_argument("--quant_4bit", action="store_true",
                    help="Enable QLoRA 4-bit loading (CUDA only).")
-    p.add_argument("--early_stopping_patience", type=int, default=3)
+    p.add_argument("--early_stopping_patience", type=int, default=5)
+    p.add_argument("--force_gradient_checkpointing", action="store_true",
+                   help="Force activation of gradient checkpointing even on CUDA.")
     p.add_argument("--skip_audit", action="store_true",
                    help="Skip the pre-training dataset audit (not recommended).")
     return p.parse_args()
@@ -225,12 +227,28 @@ def main():
             "gradient_accumulation_steps, otherwise the LR schedule is degenerate."
         )
 
-    # ---- device / dtype -----------------------------------------------------
+    eval_steps = max(1, steps_per_epoch // 2)
+    print(f"Evaluating / saving every {eval_steps} steps (~0.5 epochs).")
+
+    # ---- device / dtype / TF32 / diagnostics --------------------------------
     if torch.cuda.is_available():
+        # Enable TF32 for speedup on Ampere/Ada/Blackwell architectures
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
         device_map = "auto"
         bf16 = torch.cuda.is_bf16_supported()
         model_dtype = torch.bfloat16 if bf16 else torch.float16
         use_bf16, use_fp16 = bf16, not bf16
+        
+        device_idx = torch.cuda.current_device()
+        device_name = torch.cuda.get_device_name(device_idx)
+        total_mem = torch.cuda.get_device_properties(device_idx).total_memory / (1024 ** 3)
+        print("CUDA Diagnostics:")
+        print(f"  Device: {device_name} (index {device_idx})")
+        print(f"  Total VRAM: {total_mem:.2f} GB")
+        print(f"  BF16 supported: {bf16}")
+        print(f"  TF32 enabled: True (allow_tf32 = True)")
     elif torch.backends.mps.is_available():
         device_map, model_dtype = None, torch.float32
         use_bf16 = use_fp16 = False
@@ -238,6 +256,23 @@ def main():
     else:
         device_map, model_dtype = None, torch.float32
         use_bf16 = use_fp16 = False
+        print("CPU: float32 training.")
+
+    # Determine gradient checkpointing status
+    if args.force_gradient_checkpointing:
+        use_grad_checkpointing = True
+        grad_checkpointing_reason = "forced via CLI flag"
+    elif not torch.cuda.is_available():
+        use_grad_checkpointing = True
+        grad_checkpointing_reason = "active by default on CPU/MPS"
+    elif args.quant_4bit:
+        use_grad_checkpointing = True
+        grad_checkpointing_reason = "active by default with 4-bit quantization"
+    else:
+        use_grad_checkpointing = False
+        grad_checkpointing_reason = "disabled by default on CUDA (non-quantized)"
+
+    print(f"Gradient Checkpointing: {'ON' if use_grad_checkpointing else 'OFF'} ({grad_checkpointing_reason})")
 
     bnb_config = None
     if args.quant_4bit:
@@ -315,15 +350,16 @@ def main():
             max_length=args.max_length,
             max_prompt_length=args.max_prompt_length,
             per_device_train_batch_size=args.batch_size,
-            per_device_eval_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.batch_size * 2,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},  # needed w/ PEFT
+            gradient_checkpointing=use_grad_checkpointing,
             learning_rate=args.learning_rate,
             weight_decay=0.05,
             num_train_epochs=args.epochs,
-            eval_strategy="epoch",
-            save_strategy="epoch",
+            eval_strategy="steps",
+            eval_steps=eval_steps,
+            save_strategy="steps",
+            save_steps=eval_steps,
             save_total_limit=2,
             logging_steps=1,
             warmup_steps=max(2, steps_per_epoch // 3),  # step-based, not ratio:
@@ -341,6 +377,8 @@ def main():
             seed=seed,
             report_to="none",
         )
+        if use_grad_checkpointing:
+            config_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
         supported = set(inspect.signature(DPOConfig.__init__).parameters)
         dropped = sorted(k for k in config_kwargs if k not in supported)
         if dropped:
