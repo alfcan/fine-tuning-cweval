@@ -86,7 +86,7 @@ Train LoRA/PEFT adapters with TRL's `DPOTrainer` (using the IPO loss) across 3 i
 python train_ipo.py \
   --model_id "Qwen/Qwen3.5-2B" \
   --dataset_dir "results/dataset" \
-  --epochs 3 \
+  --epochs 5 \
   --batch_size 4 \
   --quant_4bit False
 ```

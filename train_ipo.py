@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha scaling factor")
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=5, help="Max number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=1, help="Per-device train batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="Per-device train batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--quant_4bit", type=str, default="False", choices=["True", "False"], help="Load model in 4-bit QLoRA")
     parser.add_argument("--early_stopping_patience", type=int, default=3, help="Patience for early stopping")
