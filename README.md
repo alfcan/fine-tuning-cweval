@@ -64,6 +64,21 @@ This produces `results/dataset/train_pairs.json` and `results/dataset/val_pairs.
 
 ---
 
+### Step 2.5: Optional — Supplement underrepresented tasks
+If some tasks have fewer than the minimum target pairs (or zero pairs), you can supplement the dataset using another model (e.g. via LM Studio or a configurable API endpoint). This script generates candidates, runs CWEval, and performs similarity/duplicate checking using code normalization and `difflib.SequenceMatcher` to avoid adding duplicate or near-duplicate pairs:
+
+```bash
+python generate_additional_pairs.py \
+  --model "openai/Qwen/Qwen3.5-2B" \
+  --api_base "http://localhost:1234/v1" \
+  --target_pairs 8 \
+  --n_candidates 5 \
+  --similarity_threshold 0.95 \
+  --docker True
+```
+
+---
+
 ### Step 3: Phase 4 — IPO Alignment Training
 Train LoRA/PEFT adapters with TRL's `DPOTrainer` (using the IPO loss) across 3 independent seeds. This script runs fine-tuning in full precision (no quantization) on the Qwen 2B model and implements early stopping:
 
@@ -112,6 +127,7 @@ The completed markdown report will be saved at `results/report.md`.
 - [setup_env.sh](setup_env.sh): Clones CWEval, pulls Docker container, and installs python dependencies.
 - [run_baseline.py](run_baseline.py): Measures untouched model correctness and security rates.
 - [build_preference_dataset.py](build_preference_dataset.py): Explores generations, paraphrases prompts, deduplicates, and splits DPO preference pairs.
+- [generate_additional_pairs.py](generate_additional_pairs.py): Supplements underrepresented tasks with another model (LM Studio/configurable API) and filters duplicates/similar completions.
 - [train_ipo.py](train_ipo.py): Fine-tunes the QLoRA model using IPO DPO optimization.
 - [run_evaluation.py](run_evaluation.py): Merges adapters and runs final evaluation pipelines using bootstrap metrics.
 - [analyze_results.py](analyze_results.py): Formats final metrics tables and produces a research report.
