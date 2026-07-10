@@ -271,10 +271,13 @@ def main():
         eval_path = (Path(args.eval_base_dir) / name).resolve()
         res_file = eval_path / "res_all.json"
         
-        if args.only_parse:
-            print(f"\n[Only-Parse Mode] Checking existing results for: {name}")
-            if not res_file.exists():
-                print(f"res_all.json not found for {name} at {res_file}. Skipping.")
+        skip_active = args.only_parse or res_file.exists()
+        
+        if skip_active:
+            if res_file.exists():
+                print(f"\n[Skip Active] Existing evaluation results found for {name} at {res_file}. Skipping active generation and evaluation.")
+            else:
+                print(f"\n[Only-Parse Mode] res_all.json not found for {name} at {res_file}. Skipping.")
                 continue
         else:
             print(f"\n==========================================")
