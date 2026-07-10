@@ -3,8 +3,10 @@
 run_evaluation.py - Phase 5: Evaluation
 Performs weight merging for trained PEFT adapters.
 Automates evaluation of base and tuned seed models on Python, JS, C, C++, Go.
-Calculates pass@1, security-rate, splits by CWE category (known vs novel),
-computes bootstrap confidence intervals, and aggregates variance across seeds.
+Calculates pass@1 (func@1), func-sec@1, and conditional security rate,
+splits by CWE category (known vs novel), computes bootstrap confidence intervals,
+compares base vs tuned via paired task-level McNemar/binomial flip checks,
+and aggregates variance across seeds.
 """
 
 import os
@@ -14,6 +16,8 @@ import subprocess
 import sys
 import random
 import time
+import re
+import math
 import requests
 import urllib.parse
 from pathlib import Path
@@ -35,6 +39,7 @@ def parse_args():
     parser.add_argument("--bootstrap_samples", type=int, default=1000, help="Number of bootstrap resamples for CI")
     parser.add_argument("--api_base", type=str, default="http://localhost:1234/v1", help="Local model server API base url")
     parser.add_argument("--api_key", type=str, default="sk-local-research", help="API key for inference server")
+    parser.add_argument("--only_parse", action="store_true", help="Only parse already existing evaluation results without running active generation/eval")
     return parser.parse_args()
 
 def run_command(cmd, cwd=None):
@@ -52,7 +57,6 @@ def run_command(cmd, cwd=None):
     return ""
 
 def start_local_server(model_id_or_path, api_base):
-    # Parse port from api_base (e.g. http://localhost:1234/v1)
     port = 1234
     try:
         parsed = urllib.parse.urlparse(api_base)
@@ -72,7 +76,6 @@ def start_local_server(model_id_or_path, api_base):
         "--port", str(port)
     ])
 
-    # Wait for the server to be ready by checking /health endpoint
     max_retries = 60
     for i in range(max_retries):
         try:
@@ -96,10 +99,13 @@ def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
     """
     Loads base model and merges PEFT adapters for each seed, saving full models.
     """
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    try:
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError:
+        print("PEFT / transformers not available for merging locally. Skipping merge step. Assuming merged models are already in place.")
+        return
 
-    # Clean the base_model_id (strip openai/ if present)
     base_model_id_clean = base_model_id
     if base_model_id_clean.startswith("openai/"):
         base_model_id_clean = base_model_id_clean[len("openai/"):]
@@ -138,7 +144,6 @@ def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
         merged_model.save_pretrained(str(seed_merged))
         tokenizer.save_pretrained(str(seed_merged))
         
-        # Clean up memory
         del base_model
         del model
         del merged_model
@@ -147,40 +152,59 @@ def merge_peft_adapters(base_model_id, adapter_dir, output_dir, seeds):
         
     print("\nPEFT adapters merged successfully.")
 
-def check_func_and_sec(attempt):
-    if isinstance(attempt, dict):
-        func = None
-        for k in ["func", "func_correct", "functional", "correct", "passed", "pass", "functional_correctness"]:
-            if k in attempt:
-                func = bool(attempt[k])
-                break
-        if func is None:
-            func = attempt.get("status") == "success" or attempt.get("exit_code") == 0
+def filename_to_lang(path: str) -> str:
+    normalized_path = path.replace("\\", "/")
+    categories = ["core/c/", "core/cpp/", "core/go/", "core/py/", "core/js/", "lang/c"]
+    for cat in categories:
+        if cat in normalized_path:
+            if "py" in cat: return "python"
+            if "js" in cat: return "js"
+            if "cpp" in cat: return "cpp"
+            if "go" in cat: return "go"
+            if "c/" in cat or "lang/c" in cat: return "c"
+    
+    # Fallback to name/extension check
+    filename = os.path.splitext(os.path.basename(path))[0].lower()
+    if "_py_" in filename or filename.endswith(".py"): return "python"
+    if "_js_" in filename or filename.endswith(".js"): return "js"
+    if "_go_" in filename or filename.endswith(".go"): return "go"
+    if "_cpp_" in filename or filename.endswith(".cpp") or filename.endswith(".cc"): return "cpp"
+    if "_c_" in filename or filename.endswith(".c"): return "c"
+    return "unknown"
 
-        sec = None
-        for k in ["sec", "secure", "security", "safe"]:
-            if k in attempt:
-                sec = bool(attempt[k])
-                break
-        if sec is None:
-            if "vulnerable" in attempt:
-                sec = not bool(attempt["vulnerable"])
-            elif "vuln" in attempt:
-                sec = not bool(attempt["vuln"])
-        
-        if func is None: func = False
-        if sec is None: sec = False
-        return func, sec
-    elif isinstance(attempt, (list, tuple)):
-        if len(attempt) >= 2:
-            return bool(attempt[0]), bool(attempt[1])
-        elif len(attempt) == 1:
-            return bool(attempt[0]), True
-    return False, False
+def extract_cwe_id(path: str) -> str:
+    match = re.search(r'(cwe[_-]?\d+)', path, re.IGNORECASE)
+    if match:
+        return match.group(1).lower().replace("-", "_")
+    return "unknown"
+
+def normalize_task_id(task_id: str) -> str:
+    path = task_id.replace("\\", "/")
+    parts = path.split("/")
+    for idx, part in enumerate(parts):
+        if part.startswith("generated_"):
+            return "/".join(parts[idx + 1:])
+    return path
+
+def exact_binomial_test(b, c):
+    """
+    Performs a two-tailed exact binomial test on discordant pairs b (degraded) and c (improved).
+    Returns the p-value.
+    """
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    p_val = 0.0
+    for i in range(k + 1):
+        p_val += math.comb(n, i) * (0.5 ** n)
+    p_val = min(1.0, p_val * 2)
+    return p_val
 
 def bootstrap_ci(data, num_bootstraps=1000, ci=95):
     """
     Computes bootstrap confidence intervals (lower and upper percentiles) for a binary list.
+    Returns values in percentage points [0.0, 100.0].
     """
     if not data:
         return 0.0, 0.0
@@ -196,11 +220,9 @@ def bootstrap_ci(data, num_bootstraps=1000, ci=95):
 def main():
     args = parse_args()
     
-    # Disable parallel tokenization and bypass macOS fork safety locks to prevent deadlocks
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
     
-    # Configure API base and key in environment for litellm
     if args.api_base:
         os.environ["OPENAI_API_BASE"] = args.api_base
         print(f"Set environment OPENAI_API_BASE={args.api_base}")
@@ -210,12 +232,9 @@ def main():
         
     seeds = [int(s.strip()) for s in args.seeds.split(",")]
     
-    # 1. Merge adapters if not skipped
-    if not args.skip_merge:
-        try:
-            merge_peft_adapters(args.model_id, args.adapter_dir, args.merged_dir, seeds)
-        except ImportError:
-            print("PEFT / transformers not available for merging locally. Skipping merge step. Assuming merged models are already in place.")
+    # 1. Merge adapters if active and not only_parse
+    if not args.skip_merge and not args.only_parse:
+        merge_peft_adapters(args.model_id, args.adapter_dir, args.merged_dir, seeds)
 
     # 2. Identify the training CWEs from dataset summary
     summary_path = Path(args.dataset_dir) / "dataset_summary.json"
@@ -224,10 +243,10 @@ def main():
         with open(summary_path, "r") as f:
             meta = json.load(f)
         for task_id in meta.get("task_distribution", {}).keys():
-            # task_id structure: "python/cwe-XXX/task_YYY"
-            parts = task_id.split("/")
-            if len(parts) >= 2:
-                known_cwes.add(parts[1])
+            cwe = extract_cwe_id(task_id)
+            if cwe != "unknown":
+                known_cwes.add(cwe)
+        print(f"Loaded {len(known_cwes)} known CWEs from training set: {sorted(list(known_cwes))}")
     else:
         print(f"Warning: Dataset summary not found at {summary_path}. Novel vs Known CWE analysis will be skipped.")
 
@@ -241,8 +260,7 @@ def main():
             if "RISK" in item.get("risk_status", ""):
                 at_risk_langs[lang] = item["risk_status"]
     
-    # 4. Evaluation Loop
-    # We will evaluate the base model and each seed model
+    # 4. Evaluation / Parsing Loop
     models_to_eval = {"base": args.model_id}
     for seed in seeds:
         models_to_eval[f"seed_{seed}"] = "openai/" + str(Path(args.merged_dir) / f"seed_{seed}")
@@ -250,50 +268,55 @@ def main():
     eval_results = {}
 
     for name, model_path in models_to_eval.items():
-        print(f"\n==========================================")
-        print(f"Evaluating Model Configuration: {name}")
-        print(f"==========================================")
+        eval_path = (Path(args.eval_base_dir) / name).resolve()
+        res_file = eval_path / "res_all.json"
         
-        server_proc = start_local_server(model_path, args.api_base)
-        try:
-            eval_path = (Path(args.eval_base_dir) / name).resolve()
-            # We don't delete the directory here so that run_generation.py can skip/resume already generated samples.
+        if args.only_parse:
+            print(f"\n[Only-Parse Mode] Checking existing results for: {name}")
+            if not res_file.exists():
+                print(f"res_all.json not found for {name} at {res_file}. Skipping.")
+                continue
+        else:
+            print(f"\n==========================================")
+            print(f"Evaluating Model Configuration: {name}")
+            print(f"==========================================")
             
-            gen_script = str(Path("run_generation.py").resolve())
-            eval_script = str(Path(args.cweval_dir).resolve() / "cweval" / "evaluate.py")
+            server_proc = start_local_server(model_path, args.api_base)
+            try:
+                gen_script = str(Path("run_generation.py").resolve())
+                eval_script = str(Path(args.cweval_dir).resolve() / "cweval" / "evaluate.py")
 
-            # Run generation
-            gen_cmd = [
-                sys.executable, gen_script, "gen",
-                "--model", model_path,
-                "--n", "1",
-                "--temperature", "0.0",
-                "--eval_path", str(eval_path),
-                "--api_base", args.api_base,
-                "--api_key", args.api_key,
-                "--num_proc", str(args.num_proc)
-            ]
-            run_command(gen_cmd, cwd=args.cweval_dir)
-
-            # Run evaluation pipeline
-            if args.docker == "True":
-                from cweval_orchestrator import run_evaluation_in_docker
-                run_evaluation_in_docker(str(eval_path), num_proc=args.num_proc)
-            else:
-                eval_cmd = [
-                    sys.executable, eval_script, "pipeline",
+                # Run generation
+                gen_cmd = [
+                    sys.executable, gen_script, "gen",
+                    "--model", model_path,
+                    "--n", "1",
+                    "--temperature", "0.0",
                     "--eval_path", str(eval_path),
-                    "--num_proc", str(args.num_proc),
-                    "--docker", "False"
+                    "--api_base", args.api_base,
+                    "--api_key", args.api_key,
+                    "--num_proc", str(args.num_proc)
                 ]
-                run_command(eval_cmd, cwd=args.cweval_dir)
-        finally:
-            print("Stopping local model server...")
-            server_proc.terminate()
-            server_proc.wait()
+                run_command(gen_cmd, cwd=args.cweval_dir)
+
+                # Run evaluation pipeline
+                if args.docker == "True":
+                    from cweval_orchestrator import run_evaluation_in_docker
+                    run_evaluation_in_docker(str(eval_path), num_proc=args.num_proc)
+                else:
+                    eval_cmd = [
+                        sys.executable, eval_script, "pipeline",
+                        "--eval_path", str(eval_path),
+                        "--num_proc", str(args.num_proc),
+                        "--docker", "False"
+                    ]
+                    run_command(eval_cmd, cwd=args.cweval_dir)
+            finally:
+                print("Stopping local model server...")
+                server_proc.terminate()
+                server_proc.wait()
 
         # Load res_all.json
-        res_file = eval_path / "res_all.json"
         if not res_file.exists():
             print(f"Error: res_all.json not found for {name} at {res_file}", file=sys.stderr)
             continue
@@ -301,114 +324,255 @@ def main():
         with open(res_file, "r") as f:
             res_data = json.load(f)
 
-        # Structure metrics
-        # Group tasks by language
+        # Structure metrics and group tasks by language
         lang_data = {}
         for task_id, attempts in res_data.items():
-            parts = task_id.split("/")
-            if len(parts) < 3:
-                continue
-            lang, cwe_id, task_name = parts[0], parts[1], parts[2]
+            lang = filename_to_lang(task_id)
+            cwe_id = extract_cwe_id(task_id)
             
             if lang not in lang_data:
                 lang_data[lang] = []
                 
-            # Since n=1, there is only one attempt
-            for attempt in attempts:
-                is_func, is_sec = check_func_and_sec(attempt)
-                lang_data[lang].append({
-                    "task_id": task_id,
-                    "cwe": cwe_id,
-                    "functional": is_func,
-                    "secure": is_sec
-                })
+            # Attempts contain "functional" and "secure" lists of booleans (size n=1)
+            is_func = bool(attempts.get("functional", [False])[0])
+            is_sec = bool(attempts.get("secure", [False])[0])
+            
+            lang_data[lang].append({
+                "task_id": task_id,
+                "cwe": cwe_id,
+                "functional": is_func,
+                "secure": is_sec
+            })
 
         # Calculate metrics per language
         eval_results[name] = {}
         for lang, tasks in lang_data.items():
             funcs = [t["functional"] for t in tasks]
-            
-            # Security rates are computed ONLY on correct completions
+            func_secs = [t["functional"] and t["secure"] for t in tasks]
             sec_given_func = [t["secure"] for t in tasks if t["functional"]]
 
-            pass1 = (sum(funcs) / len(funcs)) * 100.0 if funcs else 0.0
-            sec_rate = (sum(sec_given_func) / len(sec_given_func)) * 100.0 if sec_given_func else 0.0
+            pass1_rate = (sum(funcs) / len(funcs)) * 100.0 if funcs else 0.0
+            func_secure_rate = (sum(func_secs) / len(func_secs)) * 100.0 if func_secs else 0.0
+            security_rate = (sum(sec_given_func) / len(sec_given_func)) * 100.0 if sec_given_func else 0.0
 
-            # Bootstrap CIs
+            # Bootstrap CIs (95%)
             pass1_ci = bootstrap_ci(funcs, args.bootstrap_samples)
+            func_sec_ci = bootstrap_ci(func_secs, args.bootstrap_samples)
             sec_ci = bootstrap_ci(sec_given_func, args.bootstrap_samples)
 
-            # Split into known CWE vs novel CWE (for held-out languages)
+            # Splits known CWE vs novel CWE
             known_cwe_tasks = [t for t in tasks if t["cwe"] in known_cwes]
             novel_cwe_tasks = [t for t in tasks if t["cwe"] not in known_cwes]
 
             known_funcs = [t["functional"] for t in known_cwe_tasks]
+            known_func_secs = [t["functional"] and t["secure"] for t in known_cwe_tasks]
             known_sec = [t["secure"] for t in known_cwe_tasks if t["functional"]]
             
             novel_funcs = [t["functional"] for t in novel_cwe_tasks]
+            novel_func_secs = [t["functional"] and t["secure"] for t in novel_cwe_tasks]
             novel_sec = [t["secure"] for t in novel_cwe_tasks if t["functional"]]
 
             eval_results[name][lang] = {
                 "total_tasks": len(tasks),
-                "pass1_rate": pass1,
+                "func_correct": sum(funcs),
+                "func_secure": sum(func_secs),
+                "pass1_rate": pass1_rate,
                 "pass1_ci": pass1_ci,
-                "security_rate": sec_rate,
+                "func_secure_rate": func_secure_rate,
+                "func_secure_ci": func_sec_ci,
+                "security_rate": security_rate,
                 "security_ci": sec_ci,
                 "at_risk": lang in at_risk_langs,
                 "risk_message": at_risk_langs.get(lang, "OK"),
                 "known_cwe": {
                     "total_tasks": len(known_cwe_tasks),
+                    "func_correct": sum(known_funcs),
+                    "func_secure": sum(known_func_secs),
                     "pass1_rate": (sum(known_funcs) / len(known_funcs)) * 100.0 if known_funcs else 0.0,
+                    "func_secure_rate": (sum(known_func_secs) / len(known_func_secs)) * 100.0 if known_func_secs else 0.0,
                     "security_rate": (sum(known_sec) / len(known_sec)) * 100.0 if known_sec else 0.0
                 },
                 "novel_cwe": {
                     "total_tasks": len(novel_cwe_tasks),
+                    "func_correct": sum(novel_funcs),
+                    "func_secure": sum(novel_func_secs),
                     "pass1_rate": (sum(novel_funcs) / len(novel_funcs)) * 100.0 if novel_funcs else 0.0,
+                    "func_secure_rate": (sum(novel_func_secs) / len(novel_func_secs)) * 100.0 if novel_func_secs else 0.0,
                     "security_rate": (sum(novel_sec) / len(novel_sec)) * 100.0 if novel_sec else 0.0
-                }
+                },
+                "tasks_list": tasks
             }
 
-    # 5. Aggregate metrics across seeds (compute mean, std, variance)
+    # 5. Paired Comparisons (Tuned vs Base)
+    if "base" in eval_results:
+        for seed in seeds:
+            seed_name = f"seed_{seed}"
+            if seed_name not in eval_results:
+                continue
+            for lang in eval_results[seed_name].keys():
+                if lang == "tasks_list":
+                    continue
+                
+                base_tasks = eval_results["base"].get(lang, {}).get("tasks_list", [])
+                base_dict = {normalize_task_id(t["task_id"]): t for t in base_tasks}
+                
+                tuned_tasks = eval_results[seed_name][lang].get("tasks_list", [])
+                
+                improved_func = 0
+                degraded_func = 0
+                unchanged_func = 0
+                
+                improved_func_sec = 0
+                degraded_func_sec = 0
+                unchanged_func_sec = 0
+                
+                for t_tuned in tuned_tasks:
+                    norm_id = normalize_task_id(t_tuned["task_id"])
+                    if norm_id in base_dict:
+                        t_base = base_dict[norm_id]
+                        
+                        bf = t_base["functional"]
+                        tf = t_tuned["functional"]
+                        if not bf and tf:
+                            improved_func += 1
+                        elif bf and not tf:
+                            degraded_func += 1
+                        else:
+                            unchanged_func += 1
+                            
+                        bfs = t_base["functional"] and t_base["secure"]
+                        tfs = t_tuned["functional"] and t_tuned["secure"]
+                        if not bfs and tfs:
+                            improved_func_sec += 1
+                        elif bfs and not tfs:
+                            degraded_func_sec += 1
+                        else:
+                            unchanged_func_sec += 1
+                
+                p_val_func = exact_binomial_test(degraded_func, improved_func)
+                p_val_func_sec = exact_binomial_test(degraded_func_sec, improved_func_sec)
+                
+                eval_results[seed_name][lang]["comparison"] = {
+                    "functional": {
+                        "improved": improved_func,
+                        "degraded": degraded_func,
+                        "unchanged": unchanged_func,
+                        "p_value": p_val_func
+                    },
+                    "func_secure": {
+                        "improved": improved_func_sec,
+                        "degraded": degraded_func_sec,
+                        "unchanged": unchanged_func_sec,
+                        "p_value": p_val_func_sec
+                    }
+                }
+
+    # 6. Aggregate metrics across available seeds
     languages = list(eval_results["base"].keys()) if "base" in eval_results else []
+    languages = [l for l in languages if l != "tasks_list"]
+    
     aggregated_results = {
-        "base": eval_results.get("base", {}),
-        "seeds": {f"seed_{seed}": eval_results.get(f"seed_{seed}", {}) for seed in seeds},
+        "base": {},
+        "seeds": {},
         "aggregate": {}
     }
+    
+    for lang in languages:
+        base_info = eval_results["base"][lang].copy()
+        if "tasks_list" in base_info:
+            del base_info["tasks_list"]
+        aggregated_results["base"][lang] = base_info
+        
+    for seed in seeds:
+        seed_name = f"seed_{seed}"
+        if seed_name in eval_results:
+            aggregated_results["seeds"][seed_name] = {}
+            for lang in eval_results[seed_name].keys():
+                seed_info = eval_results[seed_name][lang].copy()
+                if "tasks_list" in seed_info:
+                    del seed_info["tasks_list"]
+                aggregated_results["seeds"][seed_name][lang] = seed_info
 
     for lang in languages:
         seed_pass1s = []
+        seed_func_secs = []
         seed_sec_rates = []
-        seed_known_secs = []
-        seed_novel_secs = []
-
+        
+        seed_known_pass1s = []
+        seed_known_func_secs = []
+        seed_known_sec_rates = []
+        
+        seed_novel_pass1s = []
+        seed_novel_func_secs = []
+        seed_novel_sec_rates = []
+        
+        seed_improved_func = []
+        seed_degraded_func = []
+        seed_improved_func_sec = []
+        seed_degraded_func_sec = []
+        
         for seed in seeds:
             seed_name = f"seed_{seed}"
             if seed_name in eval_results and lang in eval_results[seed_name]:
-                seed_pass1s.append(eval_results[seed_name][lang]["pass1_rate"])
-                seed_sec_rates.append(eval_results[seed_name][lang]["security_rate"])
-                seed_known_secs.append(eval_results[seed_name][lang]["known_cwe"]["security_rate"])
-                seed_novel_secs.append(eval_results[seed_name][lang]["novel_cwe"]["security_rate"])
-
+                lang_res = eval_results[seed_name][lang]
+                seed_pass1s.append(lang_res["pass1_rate"])
+                seed_func_secs.append(lang_res["func_secure_rate"])
+                seed_sec_rates.append(lang_res["security_rate"])
+                
+                seed_known_pass1s.append(lang_res["known_cwe"]["pass1_rate"])
+                seed_known_func_secs.append(lang_res["known_cwe"]["func_secure_rate"])
+                seed_known_sec_rates.append(lang_res["known_cwe"]["security_rate"])
+                
+                seed_novel_pass1s.append(lang_res["novel_cwe"]["pass1_rate"])
+                seed_novel_func_secs.append(lang_res["novel_cwe"]["func_secure_rate"])
+                seed_novel_sec_rates.append(lang_res["novel_cwe"]["security_rate"])
+                
+                comp = lang_res.get("comparison", {})
+                if comp:
+                    seed_improved_func.append(comp["functional"]["improved"])
+                    seed_degraded_func.append(comp["functional"]["degraded"])
+                    seed_improved_func_sec.append(comp["func_secure"]["improved"])
+                    seed_degraded_func_sec.append(comp["func_secure"]["degraded"])
+                    
         if seed_pass1s:
             aggregated_results["aggregate"][lang] = {
                 "pass1": {
                     "mean": float(np.mean(seed_pass1s)),
-                    "std": float(np.std(seed_pass1s)),
-                    "variance": float(np.var(seed_pass1s))
+                    "std": float(np.std(seed_pass1s)) if len(seed_pass1s) > 1 else 0.0,
+                    "min": float(np.min(seed_pass1s)),
+                    "max": float(np.max(seed_pass1s))
+                },
+                "func_secure_rate": {
+                    "mean": float(np.mean(seed_func_secs)),
+                    "std": float(np.std(seed_func_secs)) if len(seed_func_secs) > 1 else 0.0,
+                    "min": float(np.min(seed_func_secs)),
+                    "max": float(np.max(seed_func_secs))
                 },
                 "security_rate": {
                     "mean": float(np.mean(seed_sec_rates)),
-                    "std": float(np.std(seed_sec_rates)),
-                    "variance": float(np.var(seed_sec_rates))
+                    "std": float(np.std(seed_sec_rates)) if len(seed_sec_rates) > 1 else 0.0,
+                    "min": float(np.min(seed_sec_rates)),
+                    "max": float(np.max(seed_sec_rates))
                 },
-                "known_cwe_security_rate": {
-                    "mean": float(np.mean(seed_known_secs)) if seed_known_secs else 0.0,
-                    "std": float(np.std(seed_known_secs)) if seed_known_secs else 0.0
+                "known_cwe": {
+                    "pass1": {"mean": float(np.mean(seed_known_pass1s)), "std": float(np.std(seed_known_pass1s)) if len(seed_known_pass1s) > 1 else 0.0},
+                    "func_secure_rate": {"mean": float(np.mean(seed_known_func_secs)), "std": float(np.std(seed_known_func_secs)) if len(seed_known_func_secs) > 1 else 0.0},
+                    "security_rate": {"mean": float(np.mean(seed_known_sec_rates)), "std": float(np.std(seed_known_sec_rates)) if len(seed_known_sec_rates) > 1 else 0.0}
                 },
-                "novel_cwe_security_rate": {
-                    "mean": float(np.mean(seed_novel_secs)) if seed_novel_secs else 0.0,
-                    "std": float(np.std(seed_novel_secs)) if seed_novel_secs else 0.0
+                "novel_cwe": {
+                    "pass1": {"mean": float(np.mean(seed_novel_pass1s)), "std": float(np.std(seed_novel_pass1s)) if len(seed_novel_pass1s) > 1 else 0.0},
+                    "func_secure_rate": {"mean": float(np.mean(seed_novel_func_secs)), "std": float(np.std(seed_novel_func_secs)) if len(seed_novel_func_secs) > 1 else 0.0},
+                    "security_rate": {"mean": float(np.mean(seed_novel_sec_rates)), "std": float(np.std(seed_novel_sec_rates)) if len(seed_novel_sec_rates) > 1 else 0.0}
+                },
+                "comparison": {
+                    "functional": {
+                        "improved_mean": float(np.mean(seed_improved_func)) if seed_improved_func else 0.0,
+                        "degraded_mean": float(np.mean(seed_degraded_func)) if seed_degraded_func else 0.0
+                    },
+                    "func_secure": {
+                        "improved_mean": float(np.mean(seed_improved_func_sec)) if seed_improved_func_sec else 0.0,
+                        "degraded_mean": float(np.mean(seed_degraded_func_sec)) if seed_degraded_func_sec else 0.0
+                    }
                 }
             }
 
@@ -418,7 +582,7 @@ def main():
     summary_file = output_dir / "eval_summary.json"
     with open(summary_file, "w") as f:
         json.dump(aggregated_results, f, indent=2)
-
+ 
     print(f"\nEvaluation summary written to {summary_file}")
 
 if __name__ == "__main__":
